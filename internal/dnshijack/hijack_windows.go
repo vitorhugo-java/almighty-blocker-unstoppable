@@ -118,8 +118,12 @@ func (g *Guard) enforce() error {
 // Subsequent servers appear on their own indented lines.  We locate the first
 // "dns server" label line and read the IP that follows the colon on that line.
 func primaryDNSIs127(output string) bool {
+	const marker = "dns server"
 	for _, line := range strings.Split(output, "\n") {
-		if !strings.Contains(strings.ToLower(line), "dns server") {
+		// Case-insensitive search: lower-case once per line to avoid allocating
+		// a new string for every Contains call.
+		lowerLine := strings.ToLower(line)
+		if !strings.Contains(lowerLine, marker) {
 			continue
 		}
 		// The first server IP follows the last colon on this label line.

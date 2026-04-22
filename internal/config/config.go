@@ -131,7 +131,10 @@ func (l *Loader) reload() error {
 
 	// Normalise upstream entries – add ":53" when no port was specified.
 	// Use net.SplitHostPort so that bare IPv6 addresses (which contain ":"
-	// but no port) are handled correctly.
+	// but no port) are handled correctly.  SplitHostPort returns an error for
+	// any input that lacks a port (e.g. "8.8.8.8" or "2001:db8::1"), and
+	// net.JoinHostPort adds the correct brackets for IPv6 automatically, so
+	// "[2001:db8::1]:53" is produced for bare IPv6 hosts.
 	for i, u := range cfg.UpstreamDNS {
 		if _, _, err := net.SplitHostPort(u); err != nil {
 			// No explicit port – append the standard DNS port.
@@ -192,10 +195,13 @@ func (l *Loader) Watch(ctx context.Context, onChange func(EnvConfig)) error {
 			if filepath.Base(event.Name) != base {
 				continue
 			}
-			// React to writes, atomic rename-based writes (Write or Create on
-			// the target path) and rename events (the file was moved away and
-			// possibly replaced).
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
+			// React to writes and atomic rename-based saves.  When an editor
+			// replaces the file atomically (write temp → rename to target) the
+			// OS emits a Create event for the target filename in the directory;
+			// Write covers in-place saves.  We intentionally omit Rename here:
+			// that event fires when the file is renamed *away*, which would only
+			// produce a spurious reload-error log without benefiting hot-reload.
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 				if err := l.reload(); err != nil {
 					l.log.Error("config reload failed", "error", err)
 					continue
