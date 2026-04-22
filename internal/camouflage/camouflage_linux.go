@@ -38,6 +38,11 @@ var systemLikeNames = []string{
 // The serviceName parameter is accepted for API compatibility with the Windows
 // implementation but is not used on Linux.
 //
+// Note: math/rand is used here because the randomness does not need to be
+// cryptographically secure – we are only choosing a process name from a small
+// pool, not generating secrets.  Go 1.20+ automatically seeds math/rand with a
+// random value at startup, so consecutive runs produce different results.
+//
 // Note: PR_SET_NAME only affects the name of the calling OS thread (goroutine
 // scheduler thread).  The main executable path reported by /proc/<pid>/exe is
 // unchanged.

@@ -40,11 +40,16 @@ var descriptions = []string{
 	"Maintains local network configuration state for system services.",
 }
 
-// Randomize updates the Windows service registry entries for the named service
+// Randomize changes the Windows service registry entries for the named service
 // with randomly selected display name and description strings.
 //
 // This function requires the process to be running as SYSTEM or Administrator
 // because it writes to HKLM (HKEY_LOCAL_MACHINE).
+//
+// Note: math/rand is used here because the randomness does not need to be
+// cryptographically secure – we are only choosing a display name from a small
+// pool, not generating secrets.  Go 1.20+ automatically seeds math/rand with a
+// random value at startup, so consecutive runs produce different results.
 func Randomize(serviceName string) {
 	log := slog.Default().With("component", "camouflage")
 

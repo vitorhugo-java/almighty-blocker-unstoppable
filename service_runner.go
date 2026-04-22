@@ -106,6 +106,11 @@ func runAsService(role, serviceName, stateDir string, protectionOff bool) error 
 	if stateDir != "" {
 		args = append(args, "--state-dir="+stateDir)
 	}
+	// Preserve the --protection flag so that when the OS restarts the service
+	// after a crash or reboot it honours the original protection setting.
+	if protectionOff {
+		args = append(args, "--protection=off")
+	}
 
 	cfg := &service.Config{
 		// Name is the internal identifier used by sc.exe / systemctl.

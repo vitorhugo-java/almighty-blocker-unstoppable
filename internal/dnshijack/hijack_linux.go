@@ -9,8 +9,10 @@ package dnshijack
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -70,7 +72,8 @@ func (g *Guard) Run(ctx context.Context) {
 }
 
 // enforce checks /etc/resolv.conf and overwrites it if it no longer points to
-// 127.0.0.1.
+// 127.0.0.1.  The write is performed atomically via write-to-temp + rename so
+// that concurrent readers never see a partially written file.
 func (g *Guard) enforce() error {
 	current, err := os.ReadFile(resolvConf)
 	if err != nil {
@@ -84,7 +87,38 @@ func (g *Guard) enforce() error {
 
 	g.log.Warn("DNS hijack detected – restoring 127.0.0.1 in " + resolvConf)
 
-	// Overwrite with the minimal valid resolv.conf that points to our local server.
-	// File mode 0644: owner rw, group r, other r – standard for system config files.
-	return os.WriteFile(resolvConf, []byte(expectedContent), 0o644)
+	// Write atomically: create a temp file in the same directory, then rename.
+	// rename(2) is atomic on POSIX systems – readers always see either the old
+	// or the new file, never a partial write.
+	// Java analogy: Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING).
+	dir := filepath.Dir(resolvConf)
+	tmp, err := os.CreateTemp(dir, ".resolv.conf.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp resolv.conf: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.WriteString(expectedContent); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("write temp resolv.conf: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("close temp resolv.conf: %w", err)
+	}
+
+	// Ensure the temp file has the correct permissions before renaming.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("chmod temp resolv.conf: %w", err)
+	}
+
+	// Atomic rename – replaces /etc/resolv.conf in a single syscall.
+	if err := os.Rename(tmpName, resolvConf); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename temp resolv.conf: %w", err)
+	}
+
+	return nil
 }
