@@ -23,3 +23,11 @@ go.work.sum
 
 # env file
 .env
+/.gemini
+/dist
+env.json
+/.antigravity
+/.claude
+/.codex
+/.cursor
+/.aiox-core
