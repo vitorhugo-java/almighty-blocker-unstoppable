@@ -5,5 +5,9 @@
   ],
   "files": [
     "/path/to/local/blocklist.txt"
+  ],
+  "upstreamDNS": [
+    "8.8.8.8:53",
+    "1.1.1.1:53"
   ]
 }
