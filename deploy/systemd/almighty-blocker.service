@@ -1,0 +1,16 @@
+[Unit]
+Description=Almighty Blocker Hosts Enforcer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/almighty-blocker --role=primary --state-dir=/var/lib/almighty-blocker
+WorkingDirectory=/var/lib/almighty-blocker
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

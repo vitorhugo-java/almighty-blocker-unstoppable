@@ -1,6 +1,7 @@
 package redirects
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"go/format"
@@ -16,7 +17,7 @@ import (
 
 type EnvConfig struct {
 	Sources    StringList `json:"sources"`
-	SourceList []string `json:"sourceList"`
+	SourceList []string   `json:"sourceList"`
 }
 
 type StringList []string
@@ -220,7 +221,7 @@ func HostsPath() (string, error) {
 	}
 }
 
-func EnforceHostsLoop(path string, lines []string, beginMarker string, endMarker string) error {
+func EnforceHostsLoop(ctx context.Context, path string, lines []string, beginMarker string, endMarker string) error {
 	if err := enforceHosts(path, lines, beginMarker, endMarker); err != nil {
 		return err
 	}
@@ -228,13 +229,16 @@ func EnforceHostsLoop(path string, lines []string, beginMarker string, endMarker
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if err := enforceHosts(path, lines, beginMarker, endMarker); err != nil {
-			return err
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := enforceHosts(path, lines, beginMarker, endMarker); err != nil {
+				return err
+			}
 		}
 	}
-
-	return nil
 }
 
 func enforceHosts(path string, lines []string, beginMarker string, endMarker string) error {
