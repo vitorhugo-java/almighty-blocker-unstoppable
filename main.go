@@ -71,6 +71,12 @@ func main() {
 	// Java analogy: new CommandLineParser().parse(args) in Apache Commons CLI.
 	flag.Parse()
 
+	switch *protection {
+	case "on", "off":
+		// Valid documented values.
+	default:
+		log.Fatalf("invalid value for --protection %q: supported values are \"on\" or \"off\"", *protection)
+	}
 	protectionOff := *protection == "off"
 
 	// runAsService handles both cases:
