@@ -77,8 +77,10 @@ func (g *Guard) enforce() error {
 			continue
 		}
 
-		// If 127.0.0.1 is already the primary entry, nothing to do.
-		if strings.Contains(string(out), "127.0.0.1") {
+		// Only skip remediation when 127.0.0.1 is the *primary* (first) DNS
+		// server.  A later occurrence (e.g. a fallback resolver) is not
+		// sufficient because resolvers are tried in order.
+		if primaryDNSIs127(string(out)) {
 			continue
 		}
 
@@ -100,6 +102,39 @@ func (g *Guard) enforce() error {
 		}
 	}
 	return nil
+}
+
+// primaryDNSIs127 reports whether 127.0.0.1 is the first configured DNS server
+// for an interface by parsing the output of "netsh interface ip show dns".
+//
+// The output contains a line of the form:
+//
+//	DNS servers configured through DHCP:  <ip>
+//
+// or:
+//
+//	Statically Configured DNS Servers:    <ip>
+//
+// Subsequent servers appear on their own indented lines.  We locate the first
+// "dns server" label line and read the IP that follows the colon on that line.
+func primaryDNSIs127(output string) bool {
+	const marker = "dns server"
+	for _, line := range strings.Split(output, "\n") {
+		// Case-insensitive search: lower-case once per line to avoid allocating
+		// a new string for every Contains call.
+		lowerLine := strings.ToLower(line)
+		if !strings.Contains(lowerLine, marker) {
+			continue
+		}
+		// The first server IP follows the last colon on this label line.
+		idx := strings.LastIndex(line, ":")
+		if idx == -1 {
+			continue
+		}
+		ip := strings.TrimSpace(line[idx+1:])
+		return ip == "127.0.0.1"
+	}
+	return false
 }
 
 // activeInterfaceNames returns the names of all enabled IPv4 network interfaces

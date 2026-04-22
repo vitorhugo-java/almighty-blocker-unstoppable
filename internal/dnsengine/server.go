@@ -34,6 +34,11 @@ type Server struct {
 	mu        sync.RWMutex
 	upstreams []string
 
+	// readyCh is closed by NotifyStartedFunc once the server successfully
+	// binds its listen address.  Callers can wait on Ready() to confirm the
+	// server is up before routing system DNS to it.
+	readyCh chan struct{}
+
 	log *slog.Logger
 }
 
@@ -45,7 +50,17 @@ func New(listenAddr string, upstreams []string) *Server {
 		listenAddr: listenAddr,
 		upstreams:  normaliseUpstreams(upstreams),
 		log:        logger.New("dns-server"),
+		readyCh:    make(chan struct{}),
 	}
+}
+
+// Ready returns a channel that is closed once the server has successfully bound
+// its listen address.  Use this to synchronise dependent components (e.g. DNS
+// hijack guard) so they only activate after the listener is confirmed running.
+//
+// Java analogy: a CompletableFuture<Void> that completes when the server starts.
+func (s *Server) Ready() <-chan struct{} {
+	return s.readyCh
 }
 
 // UpdateUpstreams atomically replaces the list of upstream resolvers.
@@ -80,6 +95,11 @@ func (s *Server) Run(ctx context.Context) error {
 		Handler:      mux,
 		ReadTimeout:  defaultTimeout,
 		WriteTimeout: defaultTimeout,
+		// NotifyStartedFunc is called by miekg/dns as soon as the socket is
+		// bound and the server is ready to accept queries.  Closing readyCh
+		// here unblocks any caller waiting on Ready() before enabling DNS
+		// hijack enforcement.
+		NotifyStartedFunc: func() { close(s.readyCh) },
 	}
 
 	// errCh receives the error from ListenAndServe when the server exits.

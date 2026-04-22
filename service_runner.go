@@ -29,10 +29,9 @@ import (
 // calls Future.cancel().
 type program struct {
 	// Configuration injected before Start() is called.
-	role          string // "primary" or "watchdog"
-	serviceName   string
-	stateDir      string
-	protectionOff bool
+	role        string // "primary" or "watchdog"
+	serviceName string
+	stateDir    string
 
 	// mu guards cancel so that Stop() can be called safely from any goroutine.
 	// Java analogy: a ReentrantLock protecting a volatile CancellationToken.
@@ -56,7 +55,7 @@ func (p *program) Start(s service.Service) error {
 	p.mu.Unlock()
 
 	go func() {
-		if err := runApplication(ctx, p.role, p.stateDir, p.serviceName, p.protectionOff); err != nil {
+		if err := runApplication(ctx, p.role, p.stateDir, p.serviceName); err != nil {
 			log.Printf("application error: %v", err)
 			// Notify the service manager that we stopped unexpectedly.
 			// kardianos/service translates this to the appropriate OS signal.
@@ -91,25 +90,27 @@ func (p *program) Stop(_ service.Service) error {
 //
 // Java analogy: SpringApplication.run() which adapts its startup behaviour
 // depending on whether a servlet container is detected.
-func runAsService(role, serviceName, stateDir string, protectionOff bool) error {
+func runAsService(role, serviceName, stateDir string) error {
 	p := &program{
-		role:          role,
-		serviceName:   serviceName,
-		stateDir:      stateDir,
-		protectionOff: protectionOff,
+		role:        role,
+		serviceName: serviceName,
+		stateDir:    stateDir,
 	}
 
 	// Build the service metadata shown in the OS service manager UI.
 	// The camouflage subsystem may overwrite DisplayName and Description at
 	// runtime to make the service harder to identify visually.
-	args := []string{"--role=" + role}
+	args := []string{
+		"--role=" + role,
+		// Always pass --service-name so that when the OS restarts the service
+		// after a crash or reboot it uses the same identifier that was
+		// originally registered.  Without this the binary would fall back to
+		// the default flag value, which can break service start/stop and
+		// camouflage/startup-registration.
+		"--service-name=" + serviceName,
+	}
 	if stateDir != "" {
 		args = append(args, "--state-dir="+stateDir)
-	}
-	// Preserve the --protection flag so that when the OS restarts the service
-	// after a crash or reboot it honours the original protection setting.
-	if protectionOff {
-		args = append(args, "--protection=off")
 	}
 
 	cfg := &service.Config{

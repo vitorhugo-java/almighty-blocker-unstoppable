@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -128,9 +130,15 @@ func (l *Loader) reload() error {
 	}
 
 	// Normalise upstream entries – add ":53" when no port was specified.
+	// Use net.SplitHostPort so that bare IPv6 addresses (which contain ":"
+	// but no port) are handled correctly.  SplitHostPort returns an error for
+	// any input that lacks a port (e.g. "8.8.8.8" or "2001:db8::1"), and
+	// net.JoinHostPort adds the correct brackets for IPv6 automatically, so
+	// "[2001:db8::1]:53" is produced for bare IPv6 hosts.
 	for i, u := range cfg.UpstreamDNS {
-		if !strings.Contains(u, ":") {
-			cfg.UpstreamDNS[i] = u + ":53"
+		if _, _, err := net.SplitHostPort(u); err != nil {
+			// No explicit port – append the standard DNS port.
+			cfg.UpstreamDNS[i] = net.JoinHostPort(u, "53")
 		}
 	}
 
@@ -144,8 +152,16 @@ func (l *Loader) reload() error {
 // Watch starts a background file-watcher and calls onChange whenever env.json is
 // modified.  It blocks until ctx is cancelled.
 //
-// Java analogy: registering a WatchService listener in a separate thread / Executor.
-// In Go, goroutines are the lightweight equivalent of Java threads.
+// The watcher monitors the parent directory rather than the file itself so that
+// atomic rename-based saves (used by most editors and by the atomic-write
+// pattern in hijack_linux.go) are reliably detected.  When an editor writes to a
+// temporary file and then renames it over the config path, the OS emits a Create
+// or Rename event for the config filename inside the directory – both of which
+// trigger a reload here.  Watching the file directly would lose the watch after
+// the first atomic rename because the original inode disappears.
+//
+// Java analogy: registering a WatchService listener on the parent Path with
+// ENTRY_CREATE / ENTRY_MODIFY / ENTRY_DELETE kinds.
 func (l *Loader) Watch(ctx context.Context, onChange func(EnvConfig)) error {
 	// fsnotify.NewWatcher creates an OS-level inotify/kqueue/ReadDirectoryChangesW
 	// watcher – the underlying mechanism varies per OS but the API is the same.
@@ -155,7 +171,10 @@ func (l *Loader) Watch(ctx context.Context, onChange func(EnvConfig)) error {
 	}
 	defer watcher.Close() // Always release OS resources – like try-with-resources in Java.
 
-	if err := watcher.Add(l.path); err != nil {
+	// Watch the directory so that atomic rename-based writes are detected.
+	dir := filepath.Dir(l.path)
+	base := filepath.Base(l.path)
+	if err := watcher.Add(dir); err != nil {
 		return err
 	}
 
@@ -172,7 +191,16 @@ func (l *Loader) Watch(ctx context.Context, onChange func(EnvConfig)) error {
 			if !ok {
 				return nil // Channel closed – watcher was shut down.
 			}
-			// React to writes and atomic rename-based writes (common in editors).
+			// Only process events for our config file.
+			if filepath.Base(event.Name) != base {
+				continue
+			}
+			// React to writes and atomic rename-based saves.  When an editor
+			// replaces the file atomically (write temp → rename to target) the
+			// OS emits a Create event for the target filename in the directory;
+			// Write covers in-place saves.  We intentionally omit Rename here:
+			// that event fires when the file is renamed *away*, which would only
+			// produce a spurious reload-error log without benefiting hot-reload.
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 				if err := l.reload(); err != nil {
 					l.log.Error("config reload failed", "error", err)
