@@ -15,6 +15,7 @@ package camouflage
 import (
 	"log/slog"
 	"math/rand"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -55,6 +56,15 @@ func Randomize(serviceName string) {
 	// Allocate a fixed-size byte array padded with zeros.
 	var buf [16]byte
 	copy(buf[:], name)
+
+	// LockOSThread wires the current goroutine to its OS thread for the
+	// duration of the prctl call.  Without this, the Go scheduler may migrate
+	// the goroutine to a different OS thread between the lock and the syscall,
+	// causing an arbitrary scheduler thread to be renamed instead of the
+	// intended one.  Java analogy: pinning a virtual thread to its carrier
+	// thread before a native call.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	// unix.PrctlRetInt corresponds to prctl(2) with PR_SET_NAME.
 	// unsafe.Pointer converts our array to the uintptr the kernel expects.

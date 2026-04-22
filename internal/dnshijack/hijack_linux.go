@@ -110,11 +110,21 @@ func (g *Guard) enforce() error {
 
 	g.log.Warn("DNS hijack detected – restoring 127.0.0.1 in " + resolvConf)
 
+	// Resolve symlinks: on many Linux distributions /etc/resolv.conf is a
+	// symlink managed by systemd-resolved or NetworkManager.  Replacing the
+	// path directly (os.Rename → target) would unlink the symlink and leave
+	// a regular file, permanently breaking that management layer.  Instead,
+	// resolve to the real file and write there so the symlink is preserved.
+	writeTarget := resolvConf
+	if resolved, err := filepath.EvalSymlinks(resolvConf); err == nil {
+		writeTarget = resolved
+	}
+
 	// Write atomically: create a temp file in the same directory, then rename.
 	// rename(2) is atomic on POSIX systems – readers always see either the old
 	// or the new file, never a partial write.
 	// Java analogy: Files.move(tmp, target, ATOMIC_MOVE, REPLACE_EXISTING).
-	dir := filepath.Dir(resolvConf)
+	dir := filepath.Dir(writeTarget)
 	tmp, err := os.CreateTemp(dir, ".resolv.conf.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp resolv.conf: %w", err)
@@ -137,8 +147,8 @@ func (g *Guard) enforce() error {
 		return fmt.Errorf("chmod temp resolv.conf: %w", err)
 	}
 
-	// Atomic rename – replaces /etc/resolv.conf in a single syscall.
-	if err := os.Rename(tmpName, resolvConf); err != nil {
+	// Atomic rename – replaces the real resolv.conf target in a single syscall.
+	if err := os.Rename(tmpName, writeTarget); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename temp resolv.conf: %w", err)
 	}
