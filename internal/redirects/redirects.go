@@ -18,6 +18,7 @@ import (
 type EnvConfig struct {
 	Sources    StringList `json:"sources"`
 	SourceList []string   `json:"sourceList"`
+	Files      StringList `json:"files"`
 }
 
 type StringList []string
@@ -62,6 +63,12 @@ func LoadSources(path string) ([]string, error) {
 		}
 	}
 
+	for _, item := range cfg.Files {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			sources = append(sources, trimmed)
+		}
+	}
+
 	seen := make(map[string]struct{}, len(sources))
 	unique := make([]string, 0, len(sources))
 	for _, source := range sources {
@@ -79,38 +86,49 @@ func LoadSources(path string) ([]string, error) {
 	return unique, nil
 }
 
-func FetchBlock(urls []string) (string, error) {
+func FetchBlock(sources []string) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	seen := make(map[string]struct{})
 	lines := make([]string, 0, 1024)
 
-	for _, rawURL := range urls {
-		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
-		if err != nil {
-			return "", fmt.Errorf("build request for %s: %w", rawURL, err)
-		}
-		req.Header.Set("User-Agent", "almighty-blocker-builder/1.0")
+	for _, source := range sources {
+		var body []byte
 
-		resp, err := client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("fetch %s: %w", rawURL, err)
-		}
+		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+			req, err := http.NewRequest(http.MethodGet, source, nil)
+			if err != nil {
+				return "", fmt.Errorf("build request for %s: %w", source, err)
+			}
+			req.Header.Set("User-Agent", "almighty-blocker-builder/1.0")
 
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-		closeErr := resp.Body.Close()
-		if readErr != nil {
-			return "", fmt.Errorf("read %s: %w", rawURL, readErr)
-		}
-		if closeErr != nil {
-			return "", fmt.Errorf("close %s: %w", rawURL, closeErr)
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return "", fmt.Errorf("fetch %s: unexpected status %s", rawURL, resp.Status)
+			resp, err := client.Do(req)
+			if err != nil {
+				return "", fmt.Errorf("fetch %s: %w", source, err)
+			}
+
+			read, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+			closeErr := resp.Body.Close()
+			if readErr != nil {
+				return "", fmt.Errorf("read %s: %w", source, readErr)
+			}
+			if closeErr != nil {
+				return "", fmt.Errorf("close %s: %w", source, closeErr)
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return "", fmt.Errorf("fetch %s: unexpected status %s", source, resp.Status)
+			}
+			body = read
+		} else {
+			read, err := os.ReadFile(source)
+			if err != nil {
+				return "", fmt.Errorf("read file %s: %w", source, err)
+			}
+			body = read
 		}
 
 		parsed, err := ParseLines(string(body))
 		if err != nil {
-			return "", fmt.Errorf("parse %s: %w", rawURL, err)
+			return "", fmt.Errorf("parse %s: %w", source, err)
 		}
 
 		for _, line := range parsed {

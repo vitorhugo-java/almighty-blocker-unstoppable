@@ -16,6 +16,7 @@ func main() {
 	outputDir := flag.String("out", "dist", "directory for built binaries")
 	binaryName := flag.String("binary", "almighty-blocker", "base name for output binaries")
 	targetsValue := flag.String("targets", "windows/amd64,linux/amd64", "comma-separated GOOS/GOARCH targets")
+	noProtection := flag.Bool("no-protection", false, "build with watchdog, system start, and system start monitoring disabled")
 	flag.Parse()
 
 	sourceURLs, err := redirects.LoadSources(*configPath)
@@ -55,9 +56,25 @@ func main() {
 
 		goos := parts[0]
 		goarch := parts[1]
-		outputPath := filepath.Join(*outputDir, buildName(*binaryName, goos, goarch))
+		outputPath := filepath.Join(*outputDir, buildName(*binaryName, goos, goarch, *noProtection))
 
-		cmd := exec.Command("go", "build", "-trimpath", "-o", outputPath, ".")
+		args := []string{"build", "-trimpath"}
+
+		ldflags := ""
+		if goos == "windows" && !*noProtection {
+			ldflags = "-H windowsgui"
+		}
+		if ldflags != "" {
+			args = append(args, "-ldflags", ldflags)
+		}
+
+		if *noProtection {
+			args = append(args, "-tags", "noprotection")
+		}
+
+		args = append(args, "-o", outputPath, ".")
+
+		cmd := exec.Command("go", args...)
 		cmd.Env = append(os.Environ(),
 			"CGO_ENABLED=0",
 			"GOOS="+goos,
@@ -86,8 +103,11 @@ func splitTargets(value string) []string {
 	return targets
 }
 
-func buildName(base, goos, goarch string) string {
+func buildName(base, goos, goarch string, noProtection bool) string {
 	name := fmt.Sprintf("%s-%s-%s", base, goos, goarch)
+	if noProtection {
+		name += "-unprotected"
+	}
 	if goos == "windows" {
 		return name + ".exe"
 	}
