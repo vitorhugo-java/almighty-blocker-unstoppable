@@ -1,4 +1,4 @@
-# almighty-blocker-unstoppable
+# Almighty Blocker Unstoppable
 
 Continuously enforces redirect entries in the hosts file, with watchdog failover support.
 
