@@ -143,6 +143,7 @@ func (w *Watchdog) spawn(role Role) error {
 	cmd := exec.Command(w.ExecutablePath, "--role="+string(role), "--state-dir="+w.StateDir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	configureSpawnCmd(cmd)
 	return cmd.Start()
 }
 

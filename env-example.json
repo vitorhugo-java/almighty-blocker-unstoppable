@@ -2,5 +2,8 @@
   "sources": [
     "https://example.com/blocklist-1.txt",
     "https://example.com/blocklist-2.txt"
+  ],
+  "files": [
+    "/path/to/local/blocklist.txt"
   ]
 }

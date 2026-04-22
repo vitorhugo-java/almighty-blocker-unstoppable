@@ -1,4 +1,4 @@
-//go:build !windows && !linux && !noprotection
+//go:build noprotection
 
 package main
 

@@ -44,6 +44,24 @@ func main() {
 }
 
 func runApplication(ctx context.Context, roleValue string, stateDir string, serviceName string) error {
+	lines, err := redirects.ParseLines(generatedRedirectBlock)
+	if err != nil {
+		return err
+	}
+	if len(lines) == 0 {
+		return fmt.Errorf("no embedded redirects found; fill env.json and run go run ./cmd/build")
+	}
+
+	hostsPath, err := redirects.HostsPath()
+	if err != nil {
+		return err
+	}
+
+	if !protectionEnabled {
+		log.Printf("monitoring %s (protection disabled)", hostsPath)
+		return enforceHostsLoop(ctx, hostsPath, lines)
+	}
+
 	role, err := watchdog.ParseRole(roleValue)
 	if err != nil {
 		return err
@@ -69,19 +87,6 @@ func runApplication(ctx context.Context, roleValue string, stateDir string, serv
 
 	if err := ensureStartupRegistration(serviceName, executablePath, guard.StateDir); err != nil {
 		log.Printf("startup registration check warning: %v", err)
-	}
-
-	lines, err := redirects.ParseLines(generatedRedirectBlock)
-	if err != nil {
-		return err
-	}
-	if len(lines) == 0 {
-		return fmt.Errorf("no embedded redirects found; fill env.json and run go run ./cmd/build")
-	}
-
-	hostsPath, err := redirects.HostsPath()
-	if err != nil {
-		return err
 	}
 
 	log.Printf("monitoring %s", hostsPath)
