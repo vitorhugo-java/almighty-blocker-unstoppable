@@ -71,17 +71,40 @@ func (g *Guard) Run(ctx context.Context) {
 	}
 }
 
-// enforce checks /etc/resolv.conf and overwrites it if it no longer points to
-// 127.0.0.1.  The write is performed atomically via write-to-temp + rename so
-// that concurrent readers never see a partially written file.
+// firstNameserverIsLocalhost reports whether the first non-comment nameserver
+// directive in resolv.conf points to 127.0.0.1.
+func firstNameserverIsLocalhost(content []byte) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+
+		return fields[1] == "127.0.0.1"
+	}
+
+	return false
+}
+
+// enforce checks /etc/resolv.conf and overwrites it if the first non-comment
+// nameserver entry no longer points to 127.0.0.1. The write is performed
+// atomically via write-to-temp + rename so that concurrent readers never see a
+// partially written file.
 func (g *Guard) enforce() error {
 	current, err := os.ReadFile(resolvConf)
 	if err != nil {
 		return err
 	}
 
-	// Check if the expected nameserver line is present anywhere in the file.
-	if strings.Contains(string(current), "nameserver 127.0.0.1") {
+	// Only treat the file as correct when the first active nameserver is
+	// 127.0.0.1. Later occurrences are not sufficient because resolvers try
+	// nameservers in order.
+	if firstNameserverIsLocalhost(current) {
 		return nil // Already correct – nothing to do.
 	}
 
