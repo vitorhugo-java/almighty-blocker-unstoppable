@@ -16,19 +16,60 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// StringList accepts either a JSON array of strings or a single newline-separated
+// JSON string.
+type StringList []string
+
+// UnmarshalJSON decodes either ["a", "b"] or "a\nb" into a StringList.
+func (s *StringList) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*s = nil
+		return nil
+	}
+
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		*s = StringList(list)
+		return nil
+	}
+
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if raw == "" {
+		*s = nil
+		return nil
+	}
+
+	parts := strings.Split(raw, "\n")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+
+	*s = StringList(out)
+	return nil
+}
+
 // EnvConfig is the schema for env.json.
 //
 // Java analogy: a POJO / record with @JsonProperty annotations.
 // Go uses struct field tags instead of annotations.
 type EnvConfig struct {
 	// Sources lists URLs or local file paths from which block-lists are fetched.
-	Sources []string `json:"sources"`
+	Sources StringList `json:"sources"`
 
 	// SourceList is an alternative key for the same purpose as Sources.
-	SourceList []string `json:"sourceList"`
+	SourceList StringList `json:"sourceList"`
 
 	// Files lists local file paths to include in the block-list.
-	Files []string `json:"files"`
+	Files StringList `json:"files"`
 
 	// UpstreamDNS is the ordered list of upstream DNS resolvers the local DNS
 	// server will forward queries to.  Each entry must be in "host:port" or bare
