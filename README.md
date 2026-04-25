@@ -26,8 +26,32 @@ Fields:
 - `sources`: list of remote URLs to fetch plain text block lists from.
 - `files`: list of local file paths to include when building the embedded blocklist.
 - `upstreamDNS`: optional list of upstream DNS servers (host:port). If omitted the binary falls back to public resolvers (8.8.8.8:53, 1.1.1.1:53).
+- `torEntryIPs`: optional list of IPv4 addresses of Tor guard/entry nodes to block at the network level. See [Managing torEntryIPs](#managing-torentryips) for how to populate this list.
 
 The running process also watches `env.json` at runtime and hot-reloads upstream DNS entries without restart.
+
+## Managing torEntryIPs
+
+The `torEntryIPs` field lists IPv4 addresses of Tor guard/entry nodes. Blocking these prevents devices on the network from establishing connections to the Tor network.
+
+**Manual:** edit `env.json` and add IPv4 address strings to the `torEntryIPs` array.
+
+**From Onionoo (recommended):** fetch the current list of running guard relays and extract IPv4 addresses:
+
+```bash
+curl -s 'https://onionoo.torproject.org/details?flag=Guard&running=true&fields=or_addresses' \
+  | jq -r '..|strings|scan("(\\d{1,3}(?:\\.\\d{1,3}){3})")' \
+  | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255' \
+  | sort -u
+```
+
+Copy the output into the `torEntryIPs` array in `env.json`.
+
+**Automation:** schedule a cron job (Linux) or Windows Scheduled Task to refresh the list periodically and update `env.json` on the host running the service. The service hot-reloads `env.json` on change.
+
+Notes:
+- Use only plain IPv4 addresses without ports (e.g. `"1.2.3.4"`). Ports and IPv6 addresses should be omitted.
+- The Tor relay list changes frequently; refreshing weekly or daily is recommended.
 
 ## Runtime
 
