@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,11 +75,29 @@ type EnvConfig struct {
 	Files StringList `json:"files"`
 
 	// UpstreamDNS is the ordered list of upstream DNS resolvers the local DNS
-	// server will forward queries to.  Each entry must be in "host:port" or bare
-	// "host" form (port 53 is assumed when omitted).
+	// server will forward queries to. Supported formats are:
+	//   - bare host or host:port (UDP on port 53 when omitted)
+	//   - udp://host[:port]
+	//   - tcp://host[:port]
+	//   - tls://host[:port] (DNS-over-TLS, default port 853)
+	//   - https://host[/dns-query] (DNS-over-HTTPS)
 	//
-	// Example: ["8.8.8.8:53", "1.1.1.1:53"]
+	// Example: ["https://dns.google/dns-query", "tls://1dot1dot1dot1.cloudflare-dns.com:853"]
 	UpstreamDNS []string `json:"upstreamDNS"`
+
+	// DNS is the list of external DNS servers that must remain configured on the
+	// host network adapters. Accepts host or host:port entries.
+	DNS []string `json:"DNS"`
+
+	// DNSLower accepts lowercase "dns" for compatibility with external tools.
+	DNSLower []string `json:"dns"`
+
+	// BlockAddress contains manual DNS block rules. Each entry can be a domain
+	// name (e.g. "google.com") or an IP address (e.g. "1.2.3.4").
+	BlockAddress []string `json:"blockAddress"`
+
+	// TorEntryIPs are IP entries that should be blocked at firewall level.
+	TorEntryIPs []string `json:"torEntryIPs"`
 }
 
 // Loader owns the live configuration value and keeps it in sync with the file on disk.
@@ -124,29 +143,106 @@ func (l *Loader) reload() error {
 	if err != nil {
 		return err
 	}
-	var cfg EnvConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	cfg, err := LoadFromBytes(data)
+	if err != nil {
 		return err
-	}
-
-	// Normalise upstream entries – add ":53" when no port was specified.
-	// Use net.SplitHostPort so that bare IPv6 addresses (which contain ":"
-	// but no port) are handled correctly.  SplitHostPort returns an error for
-	// any input that lacks a port (e.g. "8.8.8.8" or "2001:db8::1"), and
-	// net.JoinHostPort adds the correct brackets for IPv6 automatically, so
-	// "[2001:db8::1]:53" is produced for bare IPv6 hosts.
-	for i, u := range cfg.UpstreamDNS {
-		if _, _, err := net.SplitHostPort(u); err != nil {
-			// No explicit port – append the standard DNS port.
-			cfg.UpstreamDNS[i] = net.JoinHostPort(u, "53")
-		}
 	}
 
 	// Write lock while replacing the value.
 	l.mu.Lock()
-	l.cfg = cfg
+	l.cfg = *cfg
 	l.mu.Unlock()
 	return nil
+}
+
+// LoadFromBytes parses env.json content from memory and applies normalization.
+func LoadFromBytes(data []byte) (*EnvConfig, error) {
+	var cfg EnvConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	normalizeEnvConfig(&cfg)
+	return &cfg, nil
+}
+
+func normalizeEnvConfig(cfg *EnvConfig) {
+	if len(cfg.DNS) == 0 && len(cfg.DNSLower) > 0 {
+		cfg.DNS = append([]string(nil), cfg.DNSLower...)
+	}
+
+	if len(cfg.DNS) == 0 && len(cfg.UpstreamDNS) > 0 {
+		cfg.DNS = append([]string(nil), cfg.UpstreamDNS...)
+	}
+
+	// Normalise upstream entries with transport-aware defaults.
+	for i, u := range cfg.UpstreamDNS {
+		cfg.UpstreamDNS[i] = normalizeUpstreamAddress(u)
+	}
+
+	for i, u := range cfg.DNS {
+		cfg.DNS[i] = normalizeHostPort(strings.TrimSpace(u), "53")
+	}
+
+	for i, item := range cfg.BlockAddress {
+		cfg.BlockAddress[i] = strings.TrimSpace(item)
+	}
+
+	for i, item := range cfg.TorEntryIPs {
+		cfg.TorEntryIPs[i] = strings.TrimSpace(item)
+	}
+}
+
+func normalizeUpstreamAddress(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" {
+			return raw
+		}
+
+		switch strings.ToLower(u.Scheme) {
+		case "udp", "tcp", "tls":
+			defaultPort := "53"
+			if strings.EqualFold(u.Scheme, "tls") {
+				defaultPort = "853"
+			}
+			u.Host = normalizeHostPort(u.Host, defaultPort)
+			u.Path = ""
+			u.RawQuery = ""
+			u.Fragment = ""
+			return u.String()
+		case "https":
+			if u.Path == "" || u.Path == "/" {
+				u.Path = "/dns-query"
+			}
+			return u.String()
+		default:
+			return raw
+		}
+	}
+
+	return normalizeHostPort(raw, "53")
+}
+
+func normalizeHostPort(host string, defaultPort string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+
+	return net.JoinHostPort(host, defaultPort)
 }
 
 // Watch starts a background file-watcher and calls onChange whenever env.json is

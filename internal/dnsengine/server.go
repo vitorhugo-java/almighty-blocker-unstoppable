@@ -7,8 +7,11 @@ package dnsengine
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +23,17 @@ import (
 // defaultTimeout is how long we wait for a single upstream resolver to respond
 // before trying the next one in the list.
 const defaultTimeout = 3 * time.Second
+
+// bootstrapResolver bypasses the local DNS listener when the process needs to
+// resolve upstream hostnames (for example dns.google in DoH URLs). Without this,
+// the resolver can recurse into itself and fail all non-blocked queries.
+var bootstrapResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := &net.Dialer{Timeout: defaultTimeout}
+		return d.DialContext(ctx, "udp", "1.1.1.1:53")
+	},
+}
 
 // Server is a local UDP DNS server that proxies queries to upstream resolvers.
 //
@@ -33,6 +47,11 @@ type Server struct {
 	// Java analogy: ReentrantReadWriteLock protecting a volatile field.
 	mu        sync.RWMutex
 	upstreams []string
+
+	// blockDomains stores lower-cased domain names without trailing dots.
+	blockDomains map[string]struct{}
+	// blockIPs stores normalized IP strings to sinkhole if seen in answers.
+	blockIPs map[string]struct{}
 
 	// readyCh is closed by NotifyStartedFunc once the server successfully
 	// binds its listen address.  Callers can wait on Ready() to confirm the
@@ -49,6 +68,8 @@ func New(listenAddr string, upstreams []string) *Server {
 	return &Server{
 		listenAddr: listenAddr,
 		upstreams:  normaliseUpstreams(upstreams),
+		blockDomains: make(map[string]struct{}),
+		blockIPs:     make(map[string]struct{}),
 		log:        logger.New("dns-server"),
 		readyCh:    make(chan struct{}),
 	}
@@ -73,6 +94,36 @@ func (s *Server) UpdateUpstreams(upstreams []string) {
 	s.upstreams = normaliseUpstreams(upstreams)
 	s.mu.Unlock()
 	s.log.Info("upstream DNS servers updated", "servers", s.upstreams)
+}
+
+// UpdateBlockAddress atomically replaces the manual block rules.
+func (s *Server) UpdateBlockAddress(values []string) {
+	domains := make(map[string]struct{})
+	ips := make(map[string]struct{})
+
+	for _, raw := range values {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+
+		if ip := net.ParseIP(strings.Trim(item, "[]")); ip != nil {
+			ips[ip.String()] = struct{}{}
+			continue
+		}
+
+		domain := normalizeDomain(item)
+		if domain != "" {
+			domains[domain] = struct{}{}
+		}
+	}
+
+	s.mu.Lock()
+	s.blockDomains = domains
+	s.blockIPs = ips
+	s.mu.Unlock()
+
+	s.log.Info("DNS block rules updated", "domains", len(domains), "ips", len(ips))
 }
 
 // Run starts the DNS server and blocks until ctx is cancelled.
@@ -149,12 +200,26 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		"type", dns.TypeToString[q.Qtype],
 	)
 
-	// Take a snapshot of the upstreams slice under a read-lock so we don't
+	// Take snapshots under a read-lock so we don't
 	// block writers (hot-reload) for longer than necessary.
 	s.mu.RLock()
 	upstreams := make([]string, len(s.upstreams))
 	copy(upstreams, s.upstreams)
+	blockDomains := make(map[string]struct{}, len(s.blockDomains))
+	for domain := range s.blockDomains {
+		blockDomains[domain] = struct{}{}
+	}
+	blockIPs := make(map[string]struct{}, len(s.blockIPs))
+	for ip := range s.blockIPs {
+		blockIPs[ip] = struct{}{}
+	}
 	s.mu.RUnlock()
+
+	if isBlockedDomain(q.Name, blockDomains) {
+		s.log.Info("blocked DNS query by domain rule", "name", logger.MaskDomain(q.Name))
+		writeBlockedResponse(w, r)
+		return
+	}
 
 	if len(upstreams) == 0 {
 		s.log.Warn("no upstream DNS servers configured")
@@ -162,15 +227,17 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// dns.Client is stateless and safe to create per request.
-	// Java analogy: a new HttpClient per request (cheap in Go; goroutines are ~2 KB).
-	c := &dns.Client{Timeout: defaultTimeout}
-
 	for _, upstream := range upstreams {
-		resp, _, err := c.Exchange(r, upstream)
+		resp, err := exchangeWithUpstream(r, upstream)
 		if err != nil {
 			s.log.Debug("upstream query failed", "upstream", upstream, "error", err)
 			continue // Try next upstream – like iterating a fallback chain in Java.
+		}
+
+		if shouldSinkholeByAnswer(resp, blockIPs) {
+			s.log.Info("blocked DNS query by IP rule", "name", logger.MaskDomain(q.Name))
+			writeBlockedResponse(w, r)
+			return
 		}
 
 		// Copy the client's request ID into the response so the client can
@@ -191,18 +258,167 @@ func (s *Server) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	dns.HandleFailed(w, r)
 }
 
+func exchangeWithUpstream(req *dns.Msg, upstream string) (*dns.Msg, error) {
+	netType, address := resolveUpstreamTransport(upstream)
+	client := &dns.Client{Timeout: defaultTimeout, Net: netType}
+	client.Dialer = &net.Dialer{Timeout: defaultTimeout, Resolver: bootstrapResolver}
+
+	if netType == "tcp-tls" {
+		host := hostFromAddress(address)
+		if host != "" && net.ParseIP(host) == nil {
+			client.TLSConfig = &tls.Config{ServerName: host}
+		}
+	}
+
+	resp, _, err := client.Exchange(req, address)
+	return resp, err
+}
+
+func resolveUpstreamTransport(upstream string) (string, string) {
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" {
+		return "udp", ""
+	}
+
+	if strings.Contains(upstream, "://") {
+		u, err := url.Parse(upstream)
+		if err == nil {
+			scheme := strings.ToLower(u.Scheme)
+			switch scheme {
+			case "udp":
+				return "udp", normalizeHostPort(u.Host, "53")
+			case "tcp":
+				return "tcp", normalizeHostPort(u.Host, "53")
+			case "tls":
+				return "tcp-tls", normalizeHostPort(u.Host, "853")
+			case "https":
+				if u.Path == "" || u.Path == "/" {
+					u.Path = "/dns-query"
+				}
+				return "https", u.String()
+			}
+		}
+	}
+
+	return "udp", normalizeHostPort(upstream, "53")
+}
+
+func normalizeHostPort(host string, defaultPort string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+
+	return net.JoinHostPort(host, defaultPort)
+}
+
+func hostFromAddress(address string) string {
+	h, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+}
+
+func normalizeDomain(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	value = strings.TrimSuffix(value, ".")
+	return value
+}
+
+func isBlockedDomain(queryName string, blocked map[string]struct{}) bool {
+	if len(blocked) == 0 {
+		return false
+	}
+
+	name := normalizeDomain(queryName)
+	if name == "" {
+		return false
+	}
+
+	for domain := range blocked {
+		if name == domain || strings.HasSuffix(name, "."+domain) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func shouldSinkholeByAnswer(resp *dns.Msg, blockedIPs map[string]struct{}) bool {
+	if len(blockedIPs) == 0 || resp == nil {
+		return false
+	}
+
+	for _, answer := range resp.Answer {
+		switch rr := answer.(type) {
+		case *dns.A:
+			if _, ok := blockedIPs[rr.A.String()]; ok {
+				return true
+			}
+		case *dns.AAAA:
+			if _, ok := blockedIPs[rr.AAAA.String()]; ok {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func writeBlockedResponse(w dns.ResponseWriter, req *dns.Msg) {
+	msg := new(dns.Msg)
+	msg.SetReply(req)
+	msg.Authoritative = true
+	msg.Rcode = dns.RcodeNameError // NXDOMAIN
+
+	_ = w.WriteMsg(msg)
+}
+
 // normaliseUpstreams ensures every entry in the list has an explicit port.
 func normaliseUpstreams(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, u := range in {
+		u = strings.TrimSpace(u)
 		if u == "" {
 			continue
 		}
-		if _, _, err := net.SplitHostPort(u); err != nil {
-			// No port present – append the standard DNS port.
-			u = net.JoinHostPort(u, "53")
+		_, normalized := resolveUpstreamTransport(u)
+		if normalized == "" {
+			continue
 		}
-		out = append(out, u)
+
+		if strings.Contains(u, "://") {
+			uParsed, err := url.Parse(u)
+			if err == nil {
+				scheme := strings.ToLower(uParsed.Scheme)
+				switch scheme {
+				case "udp", "tcp", "tls":
+					uParsed.Host = normalized
+					uParsed.Path = ""
+					uParsed.RawQuery = ""
+					uParsed.Fragment = ""
+					out = append(out, uParsed.String())
+					continue
+				case "https":
+					if uParsed.Path == "" || uParsed.Path == "/" {
+						uParsed.Path = "/dns-query"
+					}
+					out = append(out, uParsed.String())
+					continue
+				}
+			}
+		}
+
+		out = append(out, normalized)
 	}
 	return out
 }

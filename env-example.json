@@ -7,8 +7,16 @@
     "/path/to/local/blocklist.txt"
   ],
   "upstreamDNS": [
-    "8.8.8.8:53",
-    "1.1.1.1:53"
+    "https://dns.google/dns-query",
+    "tls://1dot1dot1dot1.cloudflare-dns.com:853"
+  ],
+  "DNS": [
+    "1.1.1.1",
+    "1.0.0.1"
+  ],
+  "blockAddress": [
+    "google.com",
+    "1.2.3.4"
   ],
   "torEntryIPs": [
     "152.53.144.50",

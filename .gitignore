@@ -31,3 +31,5 @@ env.json
 /.codex
 /.cursor
 /.aiox-core
+generated_env.go
+generated_hosts.go

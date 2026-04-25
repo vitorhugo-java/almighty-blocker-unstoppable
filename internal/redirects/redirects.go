@@ -79,10 +79,6 @@ func LoadSources(path string) ([]string, error) {
 		unique = append(unique, source)
 	}
 
-	if len(unique) == 0 {
-		return nil, fmt.Errorf("no source urls configured in %s", path)
-	}
-
 	return unique, nil
 }
 

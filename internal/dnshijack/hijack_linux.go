@@ -1,6 +1,6 @@
 //go:build linux
 
-// Package dnshijack provides DNS hijack protection.
+// Package dnshijack provides DNS configuration protection.
 // On Linux it enforces /etc/resolv.conf every 10 seconds.
 //
 // Java analogy: a @Scheduled(fixedDelay = 10_000) method inside a Spring @Service
@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,29 +21,46 @@ import (
 )
 
 // resolvConf is the path to the Linux DNS resolver configuration.
-// Overwriting it with "nameserver 127.0.0.1" redirects all system DNS queries
-// to our local DNS server.
+// Overwriting it with configured nameserver values keeps system DNS pinned.
 const resolvConf = "/etc/resolv.conf"
 
 // checkInterval is how often we inspect the DNS configuration.
 // The problem specification mandates 10 seconds.
 const checkInterval = 10 * time.Second
 
-// expectedContent is what /etc/resolv.conf must contain.
-const expectedContent = "nameserver 127.0.0.1\n"
-
-// Guard periodically verifies that the system DNS resolver points to 127.0.0.1
+// Guard periodically verifies that the system DNS resolver points to the
+// configured external DNS entries
 // and restores it if another process (or user) changes it.
 //
 // Java analogy: a ScheduledExecutorService task that runs every 10 seconds,
 // reads a file, and writes it back when the content has drifted.
 type Guard struct {
-	log *slog.Logger
+	log      *slog.Logger
+	desired  []string
+	warnOnly bool
+	mismatch bool
 }
 
 // New creates a new Guard instance.
-func New() *Guard {
-	return &Guard{log: logger.New("dns-hijack-guard")}
+func New(desired []string, warnOnly bool) *Guard {
+	servers := make([]string, 0, len(desired))
+	for _, server := range desired {
+		candidate := strings.TrimSpace(server)
+		if candidate == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(candidate); err == nil {
+			candidate = host
+		}
+		candidate = strings.Trim(candidate, "[]")
+		if ip := net.ParseIP(candidate); ip != nil {
+			servers = append(servers, ip.String())
+		}
+	}
+	if len(servers) == 0 {
+		servers = []string{"1.1.1.1", "1.0.0.1"}
+	}
+	return &Guard{log: logger.New("dns-hijack-guard"), desired: servers, warnOnly: warnOnly}
 }
 
 // Run starts the protection loop and blocks until ctx is cancelled.
@@ -71,9 +89,14 @@ func (g *Guard) Run(ctx context.Context) {
 	}
 }
 
-// firstNameserverIsLocalhost reports whether the first non-comment nameserver
-// directive in resolv.conf points to 127.0.0.1.
-func firstNameserverIsLocalhost(content []byte) bool {
+// EnforceOnce applies configured DNS values immediately.
+func (g *Guard) EnforceOnce() error {
+	return g.enforce()
+}
+
+// firstNameserverIsDesired reports whether the first non-comment nameserver
+// directive in resolv.conf matches any configured DNS value.
+func firstNameserverIsDesired(content []byte, desired []string) bool {
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -85,14 +108,19 @@ func firstNameserverIsLocalhost(content []byte) bool {
 			continue
 		}
 
-		return fields[1] == "127.0.0.1"
+		for _, want := range desired {
+			if fields[1] == want {
+				return true
+			}
+		}
+		return false
 	}
 
 	return false
 }
 
 // enforce checks /etc/resolv.conf and overwrites it if the first non-comment
-// nameserver entry no longer points to 127.0.0.1. The write is performed
+// nameserver entry no longer points to desired DNS values. The write is performed
 // atomically via write-to-temp + rename so that concurrent readers never see a
 // partially written file.
 func (g *Guard) enforce() error {
@@ -102,13 +130,23 @@ func (g *Guard) enforce() error {
 	}
 
 	// Only treat the file as correct when the first active nameserver is
-	// 127.0.0.1. Later occurrences are not sufficient because resolvers try
+	// one of the desired DNS values. Later occurrences are not sufficient because resolvers try
 	// nameservers in order.
-	if firstNameserverIsLocalhost(current) {
+	if firstNameserverIsDesired(current, g.desired) {
+		if g.mismatch {
+			g.log.Info("DNS restored", "path", resolvConf)
+			g.mismatch = false
+		}
 		return nil // Already correct – nothing to do.
 	}
 
-	g.log.Warn("DNS hijack detected – restoring 127.0.0.1 in " + resolvConf)
+	if !g.mismatch {
+		g.log.Warn("DNS change detected in " + resolvConf)
+		g.mismatch = true
+	}
+	if g.warnOnly {
+		return nil
+	}
 
 	// Resolve symlinks: on many Linux distributions /etc/resolv.conf is a
 	// symlink managed by systemd-resolved or NetworkManager.  Replacing the
@@ -119,6 +157,8 @@ func (g *Guard) enforce() error {
 	if resolved, err := filepath.EvalSymlinks(resolvConf); err == nil {
 		writeTarget = resolved
 	}
+
+	expectedContent := buildResolvContent(g.desired)
 
 	// Write atomically: create a temp file in the same directory, then rename.
 	// rename(2) is atomic on POSIX systems – readers always see either the old
@@ -153,5 +193,18 @@ func (g *Guard) enforce() error {
 		return fmt.Errorf("rename temp resolv.conf: %w", err)
 	}
 
+	g.mismatch = false
+
 	return nil
+}
+
+func buildResolvContent(servers []string) string {
+	if len(servers) == 0 {
+		return "nameserver 1.1.1.1\n"
+	}
+	lines := make([]string, 0, len(servers))
+	for _, server := range servers {
+		lines = append(lines, "nameserver "+server)
+	}
+	return strings.Join(lines, "\n") + "\n"
 }

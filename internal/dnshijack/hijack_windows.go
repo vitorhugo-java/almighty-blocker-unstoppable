@@ -1,8 +1,8 @@
 //go:build windows
 
-// Package dnshijack provides DNS hijack protection.
-// On Windows it uses netsh to detect and restore 127.0.0.1 as the primary DNS
-// on every active IPv4 interface every 10 seconds.
+// Package dnshijack provides DNS configuration protection.
+// On Windows it uses netsh to enforce configured DNS servers on active IPv4
+// interfaces every 10 seconds.
 //
 // Java analogy: a @Scheduled(fixedDelay = 10_000) method inside a Spring @Service
 // that invokes a shell command to audit and repair the network configuration.
@@ -10,8 +10,11 @@ package dnshijack
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,18 +24,40 @@ import (
 // checkInterval is how often we inspect the DNS configuration.
 const checkInterval = 10 * time.Second
 
-// Guard periodically verifies that every active network interface uses 127.0.0.1
-// as its primary DNS server and restores it if another process changes it.
+// Guard periodically verifies that every active network interface uses one of
+// the configured DNS servers as primary and restores it when changed.
 //
 // Java analogy: a ScheduledExecutorService task running a ProcessBuilder command
 // on a fixed schedule.
 type Guard struct {
-	log *slog.Logger
+	log      *slog.Logger
+	desired  []string
+	warnOnly bool
+	mismatch map[string]bool
 }
 
 // New creates a new Guard instance.
-func New() *Guard {
-	return &Guard{log: logger.New("dns-hijack-guard")}
+func New(desired []string, warnOnly bool) *Guard {
+	filtered := make([]string, 0, len(desired))
+	for _, server := range desired {
+		host := strings.TrimSpace(server)
+		if host == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.Trim(host, "[]")
+		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+			filtered = append(filtered, ip.String())
+		}
+	}
+
+	if len(filtered) == 0 {
+		filtered = []string{"1.1.1.1", "1.0.0.1"}
+	}
+
+	return &Guard{log: logger.New("dns-hijack-guard"), desired: filtered, warnOnly: warnOnly, mismatch: map[string]bool{}}
 }
 
 // Run starts the protection loop and blocks until ctx is cancelled.
@@ -57,8 +82,13 @@ func (g *Guard) Run(ctx context.Context) {
 	}
 }
 
+// EnforceOnce applies configured DNS values immediately.
+func (g *Guard) EnforceOnce() error {
+	return g.enforce()
+}
+
 // enforce queries the current DNS configuration for all interfaces and resets
-// any that do not use 127.0.0.1 as the primary server.
+// any that do not use configured DNS values.
 func (g *Guard) enforce() error {
 	// List all IPv4 interface names using netsh.
 	// "netsh interface ipv4 show interfaces" lists active adapters.
@@ -66,6 +96,8 @@ func (g *Guard) enforce() error {
 	if err != nil {
 		return err
 	}
+
+	var failed []string
 
 	for _, iface := range ifaces {
 		// Check the DNS server configured on this interface.
@@ -77,21 +109,28 @@ func (g *Guard) enforce() error {
 			continue
 		}
 
-		// Only skip remediation when 127.0.0.1 is the *primary* (first) DNS
-		// server.  A later occurrence (e.g. a fallback resolver) is not
-		// sufficient because resolvers are tried in order.
-		if primaryDNSIs127(string(out)) {
+		if primaryDNSIsDesired(string(out), g.desired) {
+			if g.mismatch[iface] {
+				g.log.Info("DNS restored", "interface", iface)
+				g.mismatch[iface] = false
+			}
 			continue
 		}
 
-		g.log.Warn("DNS hijack detected – restoring 127.0.0.1", "interface", iface)
+		if !g.mismatch[iface] {
+			g.log.Warn("DNS change detected", "interface", iface)
+			g.mismatch[iface] = true
+		}
+		if g.warnOnly {
+			continue
+		}
 
-		// Force the primary DNS back to 127.0.0.1 using netsh.
+		// Force the primary DNS back using netsh.
 		// "static" means we are setting a static address (not DHCP-assigned).
 		// This requires the process to be running as SYSTEM or Administrator.
 		cmd := exec.Command(
 			"netsh", "interface", "ip", "set", "dns",
-			"name="+iface, "static", "127.0.0.1", "primary",
+			"name="+iface, "static", g.desired[0], "primary",
 		)
 		if setOut, setErr := cmd.CombinedOutput(); setErr != nil {
 			g.log.Error("failed to restore DNS",
@@ -99,12 +138,39 @@ func (g *Guard) enforce() error {
 				"error", setErr,
 				"output", strings.TrimSpace(string(setOut)),
 			)
+			failed = append(failed, iface)
+			continue
 		}
+
+		for idx, backup := range g.desired[1:] {
+			add := exec.Command(
+				"netsh", "interface", "ip", "add", "dns",
+				"name="+iface,
+				"addr="+backup,
+				"index="+strconv.Itoa(idx+2),
+			)
+			if addOut, addErr := add.CombinedOutput(); addErr != nil {
+				g.log.Error("failed to add secondary DNS",
+					"interface", iface,
+					"dns", backup,
+					"error", addErr,
+					"output", strings.TrimSpace(string(addOut)),
+				)
+				failed = append(failed, iface)
+			}
+		}
+
+		if len(failed) == 0 || failed[len(failed)-1] != iface {
+			g.mismatch[iface] = false
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("failed to enforce DNS on interfaces: %s", strings.Join(failed, ", "))
 	}
 	return nil
 }
 
-// primaryDNSIs127 reports whether 127.0.0.1 is the first configured DNS server
+// primaryDNSIsDesired reports whether a configured DNS server is the first entry
 // for an interface by parsing the output of "netsh interface ip show dns".
 //
 // The output contains a line of the form:
@@ -117,7 +183,7 @@ func (g *Guard) enforce() error {
 //
 // Subsequent servers appear on their own indented lines.  We locate the first
 // "dns server" label line and read the IP that follows the colon on that line.
-func primaryDNSIs127(output string) bool {
+func primaryDNSIsDesired(output string, desired []string) bool {
 	const marker = "dns server"
 	for _, line := range strings.Split(output, "\n") {
 		// Case-insensitive search: lower-case once per line to avoid allocating
@@ -132,7 +198,12 @@ func primaryDNSIs127(output string) bool {
 			continue
 		}
 		ip := strings.TrimSpace(line[idx+1:])
-		return ip == "127.0.0.1"
+		for _, want := range desired {
+			if ip == want {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }
@@ -168,6 +239,9 @@ func activeInterfaceNames() ([]string, error) {
 
 		// Skip loopback – no need to set DNS on the loopback adapter itself.
 		if strings.EqualFold(name, "Loopback Pseudo-Interface 1") {
+			continue
+		}
+		if strings.Contains(strings.ToLower(name), "zerotier") {
 			continue
 		}
 		names = append(names, name)

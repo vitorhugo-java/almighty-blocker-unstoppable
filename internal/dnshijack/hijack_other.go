@@ -19,7 +19,7 @@ type Guard struct {
 }
 
 // New creates a new (no-op) Guard instance.
-func New() *Guard {
+func New(_ []string, _ bool) *Guard {
 	return &Guard{log: logger.New("dns-hijack-guard")}
 }
 
@@ -28,4 +28,8 @@ func New() *Guard {
 func (g *Guard) Run(ctx context.Context) {
 	g.log.Warn("DNS hijack protection is not supported on this platform")
 	<-ctx.Done()
+}
+
+func (g *Guard) EnforceOnce() error {
+	return nil
 }
