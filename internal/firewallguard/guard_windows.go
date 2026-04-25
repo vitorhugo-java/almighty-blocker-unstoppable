@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"almighty-blocker-unstoppable/internal/logger"
@@ -88,6 +89,7 @@ func (g *Guard) rulesExist(chunks [][]string) bool {
 	for idx := range chunks {
 		ruleName := windowsRulePrefix + " #" + strconv.Itoa(idx+1)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name="+ruleName)
+		hideWindow(cmd)
 		if err := cmd.Run(); err != nil {
 			return false
 		}
@@ -98,7 +100,9 @@ func (g *Guard) rulesExist(chunks [][]string) bool {
 func (g *Guard) applyWindowsRules(chunks [][]string) {
 	for idx, chunk := range chunks {
 		ruleName := windowsRulePrefix + " #" + strconv.Itoa(idx+1)
-		_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName).Run()
+		cmdDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
+		hideWindow(cmdDel)
+		_ = cmdDel.Run()
 
 		remote := strings.Join(chunk, ",")
 		cmd := exec.Command(
@@ -110,6 +114,7 @@ func (g *Guard) applyWindowsRules(chunks [][]string) {
 			"profile=any",
 			"remoteip="+remote,
 		)
+		hideWindow(cmd)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			g.log.Error("failed to apply firewall rule", "rule", ruleName, "error", err, "output", strings.TrimSpace(string(out)))
 		}
@@ -119,6 +124,7 @@ func (g *Guard) applyWindowsRules(chunks [][]string) {
 	for i := len(chunks) + 1; i < len(chunks)+20; i++ {
 		ruleName := windowsRulePrefix + " #" + strconv.Itoa(i)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
+		hideWindow(cmd)
 		_ = cmd.Run()
 	}
 }
@@ -145,4 +151,8 @@ func splitIPChunksByFamily(in []string, size int) [][]string {
 	chunks := splitChunks(v4, size)
 	chunks = append(chunks, splitChunks(v6, size)...)
 	return chunks
+}
+
+func hideWindow(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 }

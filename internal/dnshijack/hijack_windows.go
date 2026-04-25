@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"almighty-blocker-unstoppable/internal/logger"
@@ -102,7 +103,9 @@ func (g *Guard) enforce() error {
 	for _, iface := range ifaces {
 		// Check the DNS server configured on this interface.
 		// "netsh interface ip show dns <name>" prints the current DNS servers.
-		out, err := exec.Command("netsh", "interface", "ip", "show", "dns", "name="+iface).Output()
+		cmdShow := exec.Command("netsh", "interface", "ip", "show", "dns", "name="+iface)
+		hideWindow(cmdShow)
+		out, err := cmdShow.Output()
 		if err != nil {
 			// Non-fatal – continue with other interfaces.
 			g.log.Debug("could not read DNS for interface", "interface", iface, "error", err)
@@ -132,6 +135,7 @@ func (g *Guard) enforce() error {
 			"netsh", "interface", "ip", "set", "dns",
 			"name="+iface, "static", g.desired[0], "primary",
 		)
+		hideWindow(cmd)
 		if setOut, setErr := cmd.CombinedOutput(); setErr != nil {
 			g.log.Error("failed to restore DNS",
 				"interface", iface,
@@ -149,6 +153,7 @@ func (g *Guard) enforce() error {
 				"addr="+backup,
 				"index="+strconv.Itoa(idx+2),
 			)
+			hideWindow(add)
 			if addOut, addErr := add.CombinedOutput(); addErr != nil {
 				g.log.Error("failed to add secondary DNS",
 					"interface", iface,
@@ -216,7 +221,9 @@ func activeInterfaceNames() ([]string, error) {
 	//   -------------------------------------------------------------------------
 	//   Enabled        Connected      Dedicated        Ethernet
 	//   Enabled        Connected      Dedicated        Wi-Fi
-	out, err := exec.Command("netsh", "interface", "show", "interface").Output()
+	cmd := exec.Command("netsh", "interface", "show", "interface")
+	hideWindow(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -247,4 +254,8 @@ func activeInterfaceNames() ([]string, error) {
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+func hideWindow(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 }
