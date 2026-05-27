@@ -23,3 +23,5 @@ func (g *Guard) Run(ctx context.Context) {
 }
 
 func (g *Guard) RunOnce() {}
+
+func (g *Guard) SetTorEntryIPs(_ []string) {}
