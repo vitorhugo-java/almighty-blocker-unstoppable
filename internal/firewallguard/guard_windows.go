@@ -27,6 +27,7 @@ type Guard struct {
 	log         *slog.Logger
 	mu          sync.RWMutex
 	reconcileMu sync.Mutex
+	lastChunks  map[string]int
 	torEntryIPs []string
 	domains     []string
 	manualIPs   []string
@@ -39,6 +40,7 @@ func New(torEntryIPs []string, blockAddress []string, dnsServers []string, warnO
 	domains, manualIPs := parseBlockAddress(blockAddress)
 	return &Guard{
 		log:         logger.New("firewall-guard"),
+		lastChunks:  map[string]int{},
 		torEntryIPs: mergeIPs(torEntryIPs),
 		domains:     domains,
 		manualIPs:   manualIPs,
@@ -139,13 +141,14 @@ func (g *Guard) applyWindowsRules(prefix string, chunks [][]string) {
 		}
 	}
 
-	// Remove any extra stale chunk rules from previous runs.
-	for i := len(chunks) + 1; i < len(chunks)+20; i++ {
+	// Remove stale chunk rules left from previous refreshes.
+	for _, i := range staleChunkIndexes(g.lastChunks[prefix], len(chunks)) {
 		ruleName := prefix + " #" + strconv.Itoa(i)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 		hideWindow(cmd)
 		_ = cmd.Run()
 	}
+	g.lastChunks[prefix] = len(chunks)
 }
 
 func splitIPChunksByFamily(in []string, size int) [][]string {

@@ -124,22 +124,23 @@ func runApplication(ctx context.Context, roleValue string, stateDir string, serv
 	warnOnly := !activeProtection
 	dnsGuard := dnshijack.New(dnsServers, warnOnly)
 	fwGuard := firewallguard.New(torEntryIPs, blockAddress, dnsServers, warnOnly)
-	go torfetch.RunRefreshLoop(
-		ctx,
-		&http.Client{Timeout: 30 * time.Second},
-		torfetch.DefaultOnionooGuardURL,
-		torRefreshInterval,
-		0,
-		slog.Default().With("component", "tor-fetch"),
-		func(next []string) {
-			fwApply.SetTorEntryIPs(next)
-			fwGuard.SetTorEntryIPs(next)
-			fwApply.RunOnce()
-		},
-	)
 
 	// ── Self-defence features (skipped when built with -tags noprotection) ────
 	if activeProtection {
+		go torfetch.RunRefreshLoop(
+			ctx,
+			&http.Client{Timeout: 30 * time.Second},
+			torfetch.DefaultOnionooGuardURL,
+			torRefreshInterval,
+			0,
+			slog.Default().With("component", "tor-fetch"),
+			func(next []string) {
+				fwApply.SetTorEntryIPs(next)
+				fwGuard.SetTorEntryIPs(next)
+				fwApply.RunOnce()
+			},
+		)
+
 		// Camouflage: rename the process / service display name so it blends in
 		// with legitimate system processes.
 		// On Linux  → prctl(PR_SET_NAME)

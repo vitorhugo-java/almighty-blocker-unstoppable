@@ -136,3 +136,14 @@ func splitChunks(in []string, size int) [][]string {
 	}
 	return chunks
 }
+
+func staleChunkIndexes(previous int, current int) []int {
+	if previous <= current {
+		return nil
+	}
+	out := make([]int, 0, previous-current)
+	for i := current + 1; i <= previous; i++ {
+		out = append(out, i)
+	}
+	return out
+}

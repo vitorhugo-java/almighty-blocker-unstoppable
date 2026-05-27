@@ -159,7 +159,9 @@ func (w *Watchdog) ensurePartner() error {
 	if err != nil {
 		return err
 	}
-	if partner != nil && w.processExists(partner.PID) {
+	partnerAlive := partner != nil && w.processExists(partner.PID)
+	partnerFresh := partner != nil && stateFresh(*partner, w.StaleAfter)
+	if partnerAlive && partnerFresh {
 		w.clearPendingSpawn()
 		return nil
 	}
@@ -171,6 +173,27 @@ func (w *Watchdog) ensurePartner() error {
 			return nil
 		}
 		w.clearPendingSpawn()
+	}
+	if partnerAlive {
+		return nil
+	}
+
+	locked, err := w.claimSpawnLock(w.PartnerRole)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return nil
+	}
+	defer w.releaseSpawnLock(w.PartnerRole)
+
+	partner, err = w.readState(w.PartnerRole)
+	if err != nil {
+		return err
+	}
+	if partner != nil && w.processExists(partner.PID) {
+		w.clearPendingSpawn()
+		return nil
 	}
 
 	pid, err := w.spawn(w.PartnerRole)
@@ -244,6 +267,10 @@ func (w *Watchdog) lockPath(role Role) string {
 	return filepath.Join(w.StateDir, string(role)+".lock")
 }
 
+func (w *Watchdog) spawnLockPath(role Role) string {
+	return filepath.Join(w.StateDir, string(role)+".spawn.lock")
+}
+
 func (w *Watchdog) claimRoleLock() error {
 	lockPath := w.lockPath(w.Role)
 
@@ -284,6 +311,53 @@ func (w *Watchdog) claimRoleLock() error {
 
 func (w *Watchdog) releaseRole() {
 	lockPath := w.lockPath(w.Role)
+	lockPID, err := readPIDFile(lockPath)
+	if err != nil || lockPID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(lockPath)
+}
+
+func (w *Watchdog) claimSpawnLock(role Role) (bool, error) {
+	lockPath := w.spawnLockPath(role)
+
+	for attempt := 0; attempt < lockRetryAttempts; attempt++ {
+		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()))
+			closeErr := f.Close()
+			if writeErr != nil {
+				_ = os.Remove(lockPath)
+				return false, writeErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(lockPath)
+				return false, closeErr
+			}
+			return true, nil
+		}
+		if !os.IsExist(err) {
+			return false, err
+		}
+
+		lockPID, readErr := readPIDFile(lockPath)
+		if readErr != nil || lockPID <= 0 || !w.processExists(lockPID) {
+			if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return false, removeErr
+			}
+			continue
+		}
+		if lockPID == os.Getpid() {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	return false, fmt.Errorf("failed to claim spawn lock for %s role", role)
+}
+
+func (w *Watchdog) releaseSpawnLock(role Role) {
+	lockPath := w.spawnLockPath(role)
 	lockPID, err := readPIDFile(lockPath)
 	if err != nil || lockPID != os.Getpid() {
 		return
