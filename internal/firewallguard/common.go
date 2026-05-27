@@ -137,6 +137,8 @@ func splitChunks(in []string, size int) [][]string {
 	return chunks
 }
 
+// staleChunkIndexes returns 1-based chunk indexes that should be deleted when
+// the previous chunk count is larger than the current chunk count.
 func staleChunkIndexes(previous int, current int) []int {
 	if previous <= current {
 		return nil

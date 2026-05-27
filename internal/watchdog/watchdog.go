@@ -318,6 +318,9 @@ func (w *Watchdog) releaseRole() {
 	_ = os.Remove(lockPath)
 }
 
+// claimSpawnLock acquires the partner spawn lock for the given role.
+// It returns (true, nil) when the current process owns the lock, (false, nil)
+// when another live process already owns it, and an error only for I/O failures.
 func (w *Watchdog) claimSpawnLock(role Role) (bool, error) {
 	lockPath := w.spawnLockPath(role)
 
@@ -356,6 +359,8 @@ func (w *Watchdog) claimSpawnLock(role Role) (bool, error) {
 	return false, fmt.Errorf("failed to claim spawn lock for %s role", role)
 }
 
+// releaseSpawnLock releases a partner spawn lock only when the current process
+// is the lock owner. Non-owner and missing-lock cases are ignored.
 func (w *Watchdog) releaseSpawnLock(role Role) {
 	lockPath := w.spawnLockPath(role)
 	lockPID, err := readPIDFile(lockPath)

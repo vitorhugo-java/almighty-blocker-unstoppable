@@ -21,6 +21,7 @@ const (
 	windowsTorRulePrefix = "Almighty Blocker Tor Outbound"
 	checkInterval        = 15 * time.Second
 	chunkSize            = 25
+	initialStaleSweep    = 200
 )
 
 type Guard struct {
@@ -141,8 +142,13 @@ func (g *Guard) applyWindowsRules(prefix string, chunks [][]string) {
 		}
 	}
 
+	previous, known := g.lastChunks[prefix]
+	if !known {
+		previous = len(chunks) + initialStaleSweep
+	}
+
 	// Remove stale chunk rules left from previous refreshes.
-	for _, i := range staleChunkIndexes(g.lastChunks[prefix], len(chunks)) {
+	for _, i := range staleChunkIndexes(previous, len(chunks)) {
 		ruleName := prefix + " #" + strconv.Itoa(i)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 		hideWindow(cmd)

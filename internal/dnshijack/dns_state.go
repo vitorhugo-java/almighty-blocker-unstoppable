@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// normalizeDNSServerList extracts valid IP literals from desired DNS entries,
+// normalizes them, and removes duplicates while keeping order stable.
 func normalizeDNSServerList(desired []string) []string {
 	servers := make([]string, 0, len(desired))
 	seen := map[string]struct{}{}
@@ -105,6 +107,8 @@ func parseDNSServers(output string, wantIPv6 bool) []string {
 	return servers
 }
 
+// parseResolvNameservers parses resolv.conf-style content and returns the
+// normalized list of nameserver IPs in declaration order.
 func parseResolvNameservers(content []byte) []string {
 	servers := make([]string, 0)
 	for _, rawLine := range strings.Split(string(content), "\n") {
