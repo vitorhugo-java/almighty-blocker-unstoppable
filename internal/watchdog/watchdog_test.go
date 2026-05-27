@@ -122,3 +122,60 @@ func TestEnsurePartnerDoesNotRespawnAliveStalePartner(t *testing.T) {
 		t.Fatalf("ensurePartner returned error: %v", err)
 	}
 }
+
+func TestEnsurePartnerSkipsSpawnWhenAnotherProcessOwnsSpawnLock(t *testing.T) {
+	tempDir := t.TempDir()
+	wd, err := New(RolePrimary, filepath.Join(tempDir, "bin"), tempDir)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	wd.processExistsFunc = func(pid int) bool { return pid == 8080 }
+	wd.spawnFunc = func(Role) (int, error) {
+		t.Fatal("spawn should not be called when spawn lock is owned")
+		return 0, nil
+	}
+
+	if err := os.WriteFile(filepath.Join(tempDir, "watchdog.spawn.lock"), []byte("8080"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	if err := wd.ensurePartner(); err != nil {
+		t.Fatalf("ensurePartner returned error: %v", err)
+	}
+}
+
+func TestEnsurePartnerSpawnsWhenStateIsStaleAndProcessMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	wd, err := New(RolePrimary, filepath.Join(tempDir, "bin"), tempDir)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	wd.processExistsFunc = func(pid int) bool { return false }
+
+	spawnCalls := 0
+	wd.spawnFunc = func(Role) (int, error) {
+		spawnCalls++
+		return 4321, nil
+	}
+
+	stale := state{
+		PID:       1234,
+		UpdatedAt: time.Now().Add(-10 * time.Second).UnixNano(),
+	}
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "watchdog.json"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	if err := wd.ensurePartner(); err != nil {
+		t.Fatalf("ensurePartner returned error: %v", err)
+	}
+	if spawnCalls != 1 {
+		t.Fatalf("expected one spawn call, got %d", spawnCalls)
+	}
+}

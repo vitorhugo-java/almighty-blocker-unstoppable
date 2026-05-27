@@ -11,7 +11,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,20 +42,7 @@ type Guard struct {
 
 // New creates a new Guard instance.
 func New(desired []string, warnOnly bool) *Guard {
-	servers := make([]string, 0, len(desired))
-	for _, server := range desired {
-		candidate := strings.TrimSpace(server)
-		if candidate == "" {
-			continue
-		}
-		if host, _, err := net.SplitHostPort(candidate); err == nil {
-			candidate = host
-		}
-		candidate = strings.Trim(candidate, "[]")
-		if ip := net.ParseIP(candidate); ip != nil {
-			servers = append(servers, ip.String())
-		}
-	}
+	servers := normalizeDNSServerList(desired)
 	if len(servers) == 0 {
 		servers = []string{"1.1.1.1", "1.0.0.1"}
 	}
@@ -94,33 +80,8 @@ func (g *Guard) EnforceOnce() error {
 	return g.enforce()
 }
 
-// firstNameserverIsDesired reports whether the first non-comment nameserver
-// directive in resolv.conf matches any configured DNS value.
-func firstNameserverIsDesired(content []byte, desired []string) bool {
-	for _, line := range strings.Split(string(content), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[0] != "nameserver" {
-			continue
-		}
-
-		for _, want := range desired {
-			if fields[1] == want {
-				return true
-			}
-		}
-		return false
-	}
-
-	return false
-}
-
-// enforce checks /etc/resolv.conf and overwrites it if the first non-comment
-// nameserver entry no longer points to desired DNS values. The write is performed
+// enforce checks /etc/resolv.conf and overwrites it when the active nameserver
+// list no longer matches the desired DNS values. The write is performed
 // atomically via write-to-temp + rename so that concurrent readers never see a
 // partially written file.
 func (g *Guard) enforce() error {
@@ -129,10 +90,8 @@ func (g *Guard) enforce() error {
 		return err
 	}
 
-	// Only treat the file as correct when the first active nameserver is
-	// one of the desired DNS values. Later occurrences are not sufficient because resolvers try
-	// nameservers in order.
-	if firstNameserverIsDesired(current, g.desired) {
+	currentServers := parseResolvNameservers(current)
+	if sameServerList(currentServers, g.desired) {
 		if g.mismatch {
 			g.log.Info("DNS restored", "path", resolvConf)
 			g.mismatch = false

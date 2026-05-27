@@ -5,6 +5,34 @@ import (
 	"strings"
 )
 
+// normalizeDNSServerList extracts valid IP literals from desired DNS entries,
+// normalizes them, and removes duplicates while keeping order stable.
+func normalizeDNSServerList(desired []string) []string {
+	servers := make([]string, 0, len(desired))
+	seen := map[string]struct{}{}
+	for _, server := range desired {
+		candidate := strings.TrimSpace(server)
+		if candidate == "" {
+			continue
+		}
+		if host, _, err := net.SplitHostPort(candidate); err == nil {
+			candidate = host
+		}
+		candidate = strings.Trim(candidate, "[]")
+		ip := net.ParseIP(candidate)
+		if ip == nil {
+			continue
+		}
+		normalized := ip.String()
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		servers = append(servers, normalized)
+	}
+	return servers
+}
+
 func splitDesiredServers(desired []string) ([]string, []string) {
 	v4 := make([]string, 0, len(desired))
 	v6 := make([]string, 0, len(desired))
@@ -76,6 +104,31 @@ func parseDNSServers(output string, wantIPv6 bool) []string {
 		servers = append(servers, normalized)
 	}
 
+	return servers
+}
+
+// parseResolvNameservers parses resolv.conf-style content and returns the
+// normalized list of nameserver IPs in declaration order.
+func parseResolvNameservers(content []byte) []string {
+	servers := make([]string, 0, 4)
+	for _, rawLine := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		ip := net.ParseIP(strings.Trim(fields[1], "[]"))
+		if ip == nil {
+			continue
+		}
+		servers = append(servers, ip.String())
+	}
 	return servers
 }
 

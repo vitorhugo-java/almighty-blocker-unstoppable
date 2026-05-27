@@ -57,3 +57,37 @@ func TestSameServerList(t *testing.T) {
 		t.Fatalf("expected different length lists to not match")
 	}
 }
+
+func TestNormalizeDNSServerList(t *testing.T) {
+	t.Parallel()
+
+	got := normalizeDNSServerList([]string{
+		" 1.1.1.1 ",
+		"[2606:4700:4700::1111]",
+		"1.1.1.1:53",
+		"[2606:4700:4700::1111]:53",
+		"invalid",
+	})
+	want := []string{"1.1.1.1", "2606:4700:4700::1111"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected normalized dns list: %#v", got)
+	}
+}
+
+func TestParseResolvNameservers(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(`
+# comment
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111 # inline
+search localdomain
+nameserver invalid
+`)
+	got := parseResolvNameservers(content)
+	want := []string{"1.1.1.1", "2606:4700:4700::1111"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected resolv nameservers\nwant: %v\ngot:  %v", want, got)
+	}
+}
