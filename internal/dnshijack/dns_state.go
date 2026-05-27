@@ -110,7 +110,7 @@ func parseDNSServers(output string, wantIPv6 bool) []string {
 // parseResolvNameservers parses resolv.conf-style content and returns the
 // normalized list of nameserver IPs in declaration order.
 func parseResolvNameservers(content []byte) []string {
-	servers := make([]string, 0)
+	servers := make([]string, 0, 4)
 	for _, rawLine := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") {

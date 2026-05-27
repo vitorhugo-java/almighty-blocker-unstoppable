@@ -21,7 +21,9 @@ const (
 	windowsTorRulePrefix = "Almighty Blocker Tor Outbound"
 	checkInterval        = 15 * time.Second
 	chunkSize            = 25
-	initialStaleSweep    = 200
+	// initialStaleSweep bounds first-run cleanup of stale numbered rules from
+	// previous process lifetimes before in-memory chunk history is available.
+	initialStaleSweep = 200
 )
 
 type Guard struct {
