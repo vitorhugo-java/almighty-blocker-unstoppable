@@ -14,6 +14,9 @@ import (
 
 const DefaultOnionooGuardURL = "https://onionoo.torproject.org/details?flag=Guard&running=true&fields=or_addresses"
 
+const requestTimeout = 30 * time.Second
+const estimatedGuardCapacity = 1024
+
 type onionooResponse struct {
 	Relays []struct {
 		OrAddresses []string `json:"or_addresses"`
@@ -22,7 +25,7 @@ type onionooResponse struct {
 
 func FetchGuardIPs(ctx context.Context, client *http.Client, endpoint string, limit int) ([]string, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: requestTimeout}
 	}
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = DefaultOnionooGuardURL
@@ -49,7 +52,7 @@ func FetchGuardIPs(ctx context.Context, client *http.Client, endpoint string, li
 	}
 
 	seen := make(map[string]struct{})
-	out := make([]string, 0, 1024)
+	out := make([]string, 0, estimatedGuardCapacity)
 	for _, relay := range decoded.Relays {
 		for _, rawAddr := range relay.OrAddresses {
 			host := normalizeAddress(rawAddr)
@@ -81,9 +84,14 @@ func RunRefreshLoop(ctx context.Context, client *http.Client, endpoint string, i
 	if log == nil {
 		log = slog.Default().With("component", "tor-fetch")
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Error("tor refresh loop crashed", "panic", recovered)
+		}
+	}()
 
 	refresh := func() {
-		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		fetchCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 		defer cancel()
 		ips, err := FetchGuardIPs(fetchCtx, client, endpoint, limit)
 		if err != nil {
