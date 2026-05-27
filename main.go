@@ -2,11 +2,11 @@
 //
 // Architecture overview (for Java developers):
 //   - This is analogous to a Spring Boot application with multiple @Service beans:
-//     • config.Loader     → @ConfigurationProperties + @RefreshScope
-//     • dnshijack.Guard   → a @Scheduled DNS enforcement bean
-//     • firewallguard.Guard → a @Scheduled firewall enforcement bean
-//     • camouflage        → a @PostConstruct utility
-//     • watchdog.Watchdog → a ScheduledExecutorService that monitors a partner process
+//   - config.Loader     → @ConfigurationProperties + @RefreshScope
+//   - dnshijack.Guard   → a @Scheduled DNS enforcement bean
+//   - firewallguard.Guard → a @Scheduled firewall enforcement bean
+//   - camouflage        → a @PostConstruct utility
+//   - watchdog.Watchdog → a ScheduledExecutorService that monitors a partner process
 //   - main() wires everything together, like a Spring ApplicationContext.
 package main
 
@@ -14,19 +14,25 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"almighty-blocker-unstoppable/internal/camouflage"
 	"almighty-blocker-unstoppable/internal/config"
 	"almighty-blocker-unstoppable/internal/dnshijack"
 	"almighty-blocker-unstoppable/internal/firewallguard"
+	"almighty-blocker-unstoppable/internal/torfetch"
 	"almighty-blocker-unstoppable/internal/watchdog"
 )
 
 // defaultDNS is used when env.json does not specify DNS entries.
 var defaultDNS = []string{"1.1.1.1", "1.0.0.1"}
+
+const torRefreshInterval = 6 * time.Hour
 
 // main is the application entry point.
 //
@@ -118,6 +124,19 @@ func runApplication(ctx context.Context, roleValue string, stateDir string, serv
 	warnOnly := !activeProtection
 	dnsGuard := dnshijack.New(dnsServers, warnOnly)
 	fwGuard := firewallguard.New(torEntryIPs, blockAddress, dnsServers, warnOnly)
+	go torfetch.RunRefreshLoop(
+		ctx,
+		&http.Client{Timeout: 30 * time.Second},
+		torfetch.DefaultOnionooGuardURL,
+		torRefreshInterval,
+		0,
+		slog.Default().With("component", "tor-fetch"),
+		func(next []string) {
+			fwApply.SetTorEntryIPs(next)
+			fwGuard.SetTorEntryIPs(next)
+			fwApply.RunOnce()
+		},
+	)
 
 	// ── Self-defence features (skipped when built with -tags noprotection) ────
 	if activeProtection {

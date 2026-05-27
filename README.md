@@ -21,7 +21,7 @@ go run ./cmd/build
 This command produces Go constants (`generated_hosts.go` and `generated_env.go`) that are compiled into the binary. Typical outputs are placed under `dist/` (e.g. `dist/almighty-blocker-windows-amd64.exe`, `dist/almighty-blocker-linux-amd64`).
 
 Useful build flags:
-- `-refresh-tor-ips`: updates `torEntryIPs` from Onionoo before building.
+- `-refresh-tor-ips`: updates `torEntryIPs` from Onionoo before building (optional seed for first startup).
 - `-tor-ip-limit`: max number of unique IP entries kept in `torEntryIPs` (default `0`, unlimited).
 
 Example:
@@ -70,9 +70,9 @@ curl -s 'https://onionoo.torproject.org/details?flag=Guard&running=true&fields=o
 
 Copy the output into the `torEntryIPs` array in `env.json`.
 
-**Automation:** schedule a cron job (Linux) or Windows Scheduled Task to refresh the list periodically and rebuild so the binary embeds the updated `env.json`.
+**Runtime sync (default):** the app fetches Onionoo at runtime and periodically refreshes the in-memory Tor IP list. No rebuild is required for updates.
 
-You can also refresh automatically via builder: `go run ./cmd/build -refresh-tor-ips`.
+You can still seed `torEntryIPs` via builder (`go run ./cmd/build -refresh-tor-ips`) for the first startup while runtime sync is warming up.
 
 Notes:
 - Use only plain IP addresses without ports (e.g. `"1.2.3.4"`, `"2001:db8::1"`).
@@ -88,6 +88,7 @@ Flags:
 When protection is enabled (default build):
 - The primary enforces configured DNS servers on the OS network interfaces.
 - The primary applies firewall blocks from `torEntryIPs` and `blockAddress` (IPs directly, domains via resolved IPs).
+- Tor IPs are reconciled continuously: new Onionoo IPs are added and removed IPs are cleaned automatically from Tor-labeled firewall rules.
 - A watchdog process monitors the primary through heartbeat files in `--state-dir`. The watchdog may spawn or restart the primary when needed.
 
 When protection is disabled (build with `-tags noprotection`):

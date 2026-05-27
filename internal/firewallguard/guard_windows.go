@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,13 +17,16 @@ import (
 )
 
 const (
-	windowsRulePrefix = "Almighty Blocker Outbound"
-	checkInterval     = 15 * time.Second
-	chunkSize         = 25
+	windowsRulePrefix    = "Almighty Blocker Outbound"
+	windowsTorRulePrefix = "Almighty Blocker Tor Outbound"
+	checkInterval        = 15 * time.Second
+	chunkSize            = 25
 )
 
 type Guard struct {
 	log         *slog.Logger
+	mu          sync.RWMutex
+	reconcileMu sync.Mutex
 	torEntryIPs []string
 	domains     []string
 	manualIPs   []string
@@ -63,13 +67,27 @@ func (g *Guard) RunOnce() {
 	g.reconcileOnce()
 }
 
+func (g *Guard) SetTorEntryIPs(torEntryIPs []string) {
+	g.mu.Lock()
+	g.torEntryIPs = mergeIPs(torEntryIPs)
+	g.mu.Unlock()
+}
+
 func (g *Guard) reconcileOnce() {
+	g.reconcileMu.Lock()
+	defer g.reconcileMu.Unlock()
+
+	g.mu.RLock()
+	torIPs := append([]string(nil), g.torEntryIPs...)
+	g.mu.RUnlock()
+
 	resolved := resolveDomains(g.domains, g.dnsServers)
-	ips := mergeIPs(g.torEntryIPs, g.manualIPs, resolved)
-	chunks := splitIPChunksByFamily(ips, chunkSize)
+	otherIPs := mergeIPs(g.manualIPs, resolved)
+	torChunks := splitIPChunksByFamily(torIPs, chunkSize)
+	otherChunks := splitIPChunksByFamily(otherIPs, chunkSize)
 
 	if g.warnOnly {
-		if ok := g.rulesExist(chunks); !ok {
+		if ok := g.rulesExist(windowsRulePrefix, otherChunks) && g.rulesExist(windowsTorRulePrefix, torChunks); !ok {
 			if !g.missing {
 				g.log.Warn("firewall rules missing or changed")
 				g.missing = true
@@ -82,12 +100,13 @@ func (g *Guard) reconcileOnce() {
 	}
 
 	g.missing = false
-	g.applyWindowsRules(chunks)
+	g.applyWindowsRules(windowsRulePrefix, otherChunks)
+	g.applyWindowsRules(windowsTorRulePrefix, torChunks)
 }
 
-func (g *Guard) rulesExist(chunks [][]string) bool {
+func (g *Guard) rulesExist(prefix string, chunks [][]string) bool {
 	for idx := range chunks {
-		ruleName := windowsRulePrefix + " #" + strconv.Itoa(idx+1)
+		ruleName := prefix + " #" + strconv.Itoa(idx+1)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name="+ruleName)
 		hideWindow(cmd)
 		if err := cmd.Run(); err != nil {
@@ -97,9 +116,9 @@ func (g *Guard) rulesExist(chunks [][]string) bool {
 	return true
 }
 
-func (g *Guard) applyWindowsRules(chunks [][]string) {
+func (g *Guard) applyWindowsRules(prefix string, chunks [][]string) {
 	for idx, chunk := range chunks {
-		ruleName := windowsRulePrefix + " #" + strconv.Itoa(idx+1)
+		ruleName := prefix + " #" + strconv.Itoa(idx+1)
 		cmdDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 		hideWindow(cmdDel)
 		_ = cmdDel.Run()
@@ -122,7 +141,7 @@ func (g *Guard) applyWindowsRules(chunks [][]string) {
 
 	// Remove any extra stale chunk rules from previous runs.
 	for i := len(chunks) + 1; i < len(chunks)+20; i++ {
-		ruleName := windowsRulePrefix + " #" + strconv.Itoa(i)
+		ruleName := prefix + " #" + strconv.Itoa(i)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 		hideWindow(cmd)
 		_ = cmd.Run()
