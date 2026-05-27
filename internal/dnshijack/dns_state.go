@@ -46,7 +46,7 @@ func splitDesiredServers(desired []string) ([]string, []string) {
 }
 
 func parseDNSServers(output string, wantIPv6 bool) []string {
-	servers := make([]string, 0, 4)
+	servers := make([]string, 0)
 	seen := map[string]struct{}{}
 
 	for _, token := range strings.Fields(output) {

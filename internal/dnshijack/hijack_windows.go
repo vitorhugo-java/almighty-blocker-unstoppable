@@ -93,19 +93,17 @@ func (g *Guard) enforce() error {
 	var failed []string
 
 	for _, iface := range ifaces {
-		currentV4, err := interfaceDNSServers(iface, false)
-		if err != nil {
-			// Non-fatal – continue with other interfaces.
-			g.log.Debug("could not read IPv4 DNS for interface", "interface", iface, "error", err)
-			continue
+		currentV4, errV4 := interfaceDNSServers(iface, false)
+		if errV4 != nil {
+			g.log.Debug("could not read IPv4 DNS for interface", "interface", iface, "error", errV4)
 		}
-		currentV6, err := interfaceDNSServers(iface, true)
-		if err != nil {
-			g.log.Debug("could not read IPv6 DNS for interface", "interface", iface, "error", err)
-			continue
+		currentV6, errV6 := interfaceDNSServers(iface, true)
+		if errV6 != nil {
+			g.log.Debug("could not read IPv6 DNS for interface", "interface", iface, "error", errV6)
 		}
+		readOK := errV4 == nil && errV6 == nil
 
-		if sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
+		if readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
 			if g.mismatch[iface] {
 				g.log.Info("DNS restored", "interface", iface)
 				g.mismatch[iface] = false
@@ -121,16 +119,19 @@ func (g *Guard) enforce() error {
 			continue
 		}
 
+		interfaceFailed := false
 		if err := applyInterfaceDNS(iface, g.desiredV4, false); err != nil {
 			g.log.Error("failed to restore IPv4 DNS", "interface", iface, "error", err)
-			failed = append(failed, iface)
+			interfaceFailed = true
 		}
 		if err := applyInterfaceDNS(iface, g.desiredV6, true); err != nil {
 			g.log.Error("failed to restore IPv6 DNS", "interface", iface, "error", err)
-			failed = append(failed, iface)
+			interfaceFailed = true
 		}
 
-		if len(failed) == 0 || failed[len(failed)-1] != iface {
+		if interfaceFailed {
+			failed = append(failed, iface)
+		} else {
 			g.mismatch[iface] = false
 		}
 	}
