@@ -12,7 +12,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -31,34 +30,27 @@ const checkInterval = 10 * time.Second
 // Java analogy: a ScheduledExecutorService task running a ProcessBuilder command
 // on a fixed schedule.
 type Guard struct {
-	log      *slog.Logger
-	desired  []string
-	warnOnly bool
-	mismatch map[string]bool
+	log       *slog.Logger
+	desiredV4 []string
+	desiredV6 []string
+	warnOnly  bool
+	mismatch  map[string]bool
 }
 
 // New creates a new Guard instance.
 func New(desired []string, warnOnly bool) *Guard {
-	filtered := make([]string, 0, len(desired))
-	for _, server := range desired {
-		host := strings.TrimSpace(server)
-		if host == "" {
-			continue
-		}
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		host = strings.Trim(host, "[]")
-		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-			filtered = append(filtered, ip.String())
-		}
+	v4, v6 := splitDesiredServers(desired)
+	if len(v4) == 0 && len(v6) == 0 {
+		v4 = []string{"1.1.1.1", "1.0.0.1"}
 	}
 
-	if len(filtered) == 0 {
-		filtered = []string{"1.1.1.1", "1.0.0.1"}
+	return &Guard{
+		log:       logger.New("dns-hijack-guard"),
+		desiredV4: v4,
+		desiredV6: v6,
+		warnOnly:  warnOnly,
+		mismatch:  map[string]bool{},
 	}
-
-	return &Guard{log: logger.New("dns-hijack-guard"), desired: filtered, warnOnly: warnOnly, mismatch: map[string]bool{}}
 }
 
 // Run starts the protection loop and blocks until ctx is cancelled.
@@ -101,18 +93,19 @@ func (g *Guard) enforce() error {
 	var failed []string
 
 	for _, iface := range ifaces {
-		// Check the DNS server configured on this interface.
-		// "netsh interface ip show dns <name>" prints the current DNS servers.
-		cmdShow := exec.Command("netsh", "interface", "ip", "show", "dns", "name="+iface)
-		hideWindow(cmdShow)
-		out, err := cmdShow.Output()
-		if err != nil {
-			// Non-fatal – continue with other interfaces.
-			g.log.Debug("could not read DNS for interface", "interface", iface, "error", err)
-			continue
+		currentV4, errV4 := interfaceDNSServers(iface, false)
+		if errV4 != nil {
+			g.log.Debug("could not read IPv4 DNS for interface", "interface", iface, "error", errV4)
 		}
+		currentV6, errV6 := interfaceDNSServers(iface, true)
+		if errV6 != nil {
+			g.log.Debug("could not read IPv6 DNS for interface", "interface", iface, "error", errV6)
+		}
+		// Only skip remediation when both families are confirmed in the desired
+		// state. If any read fails, we treat it as potential drift and reapply.
+		readOK := errV4 == nil && errV6 == nil
 
-		if primaryDNSIsDesired(string(out), g.desired) {
+		if readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
 			if g.mismatch[iface] {
 				g.log.Info("DNS restored", "interface", iface)
 				g.mismatch[iface] = false
@@ -128,44 +121,19 @@ func (g *Guard) enforce() error {
 			continue
 		}
 
-		// Force the primary DNS back using netsh.
-		// "static" means we are setting a static address (not DHCP-assigned).
-		// This requires the process to be running as SYSTEM or Administrator.
-		cmd := exec.Command(
-			"netsh", "interface", "ip", "set", "dns",
-			"name="+iface, "static", g.desired[0], "primary",
-		)
-		hideWindow(cmd)
-		if setOut, setErr := cmd.CombinedOutput(); setErr != nil {
-			g.log.Error("failed to restore DNS",
-				"interface", iface,
-				"error", setErr,
-				"output", strings.TrimSpace(string(setOut)),
-			)
+		interfaceFailed := false
+		if err := applyInterfaceDNS(iface, g.desiredV4, false); err != nil {
+			g.log.Error("failed to restore IPv4 DNS", "interface", iface, "error", err)
+			interfaceFailed = true
+		}
+		if err := applyInterfaceDNS(iface, g.desiredV6, true); err != nil {
+			g.log.Error("failed to restore IPv6 DNS", "interface", iface, "error", err)
+			interfaceFailed = true
+		}
+
+		if interfaceFailed {
 			failed = append(failed, iface)
-			continue
-		}
-
-		for idx, backup := range g.desired[1:] {
-			add := exec.Command(
-				"netsh", "interface", "ip", "add", "dns",
-				"name="+iface,
-				"addr="+backup,
-				"index="+strconv.Itoa(idx+2),
-			)
-			hideWindow(add)
-			if addOut, addErr := add.CombinedOutput(); addErr != nil {
-				g.log.Error("failed to add secondary DNS",
-					"interface", iface,
-					"dns", backup,
-					"error", addErr,
-					"output", strings.TrimSpace(string(addOut)),
-				)
-				failed = append(failed, iface)
-			}
-		}
-
-		if len(failed) == 0 || failed[len(failed)-1] != iface {
+		} else {
 			g.mismatch[iface] = false
 		}
 	}
@@ -175,42 +143,108 @@ func (g *Guard) enforce() error {
 	return nil
 }
 
-// primaryDNSIsDesired reports whether a configured DNS server is the first entry
-// for an interface by parsing the output of "netsh interface ip show dns".
-//
-// The output contains a line of the form:
-//
-//	DNS servers configured through DHCP:  <ip>
-//
-// or:
-//
-//	Statically Configured DNS Servers:    <ip>
-//
-// Subsequent servers appear on their own indented lines.  We locate the first
-// "dns server" label line and read the IP that follows the colon on that line.
-func primaryDNSIsDesired(output string, desired []string) bool {
-	const marker = "dns server"
-	for _, line := range strings.Split(output, "\n") {
-		// Case-insensitive search: lower-case once per line to avoid allocating
-		// a new string for every Contains call.
-		lowerLine := strings.ToLower(line)
-		if !strings.Contains(lowerLine, marker) {
-			continue
+func interfaceDNSServers(iface string, ipv6 bool) ([]string, error) {
+	var commands [][]string
+	if ipv6 {
+		commands = [][]string{
+			{"interface", "ipv6", "show", "dnsservers", "name=" + iface},
+			{"interface", "ipv6", "show", "dnsservers", "interface=" + iface},
 		}
-		// The first server IP follows the last colon on this label line.
-		idx := strings.LastIndex(line, ":")
-		if idx == -1 {
-			continue
+	} else {
+		commands = [][]string{
+			{"interface", "ipv4", "show", "dnsservers", "name=" + iface},
+			{"interface", "ip", "show", "dns", "name=" + iface},
 		}
-		ip := strings.TrimSpace(line[idx+1:])
-		for _, want := range desired {
-			if ip == want {
-				return true
+	}
+
+	out, err := runNetshCommandVariants(commands)
+	if err != nil {
+		return nil, err
+	}
+	return parseDNSServers(string(out), ipv6), nil
+}
+
+func applyInterfaceDNS(iface string, desired []string, ipv6 bool) error {
+	family := "ipv4"
+	if ipv6 {
+		family = "ipv6"
+	}
+
+	if len(desired) == 0 {
+		var clearCommands [][]string
+		if ipv6 {
+			clearCommands = [][]string{
+				{"interface", "ipv6", "delete", "dnsservers", "name=" + iface, "all"},
+				{"interface", "ipv6", "delete", "dnsservers", "interface=" + iface, "all"},
+			}
+		} else {
+			clearCommands = [][]string{
+				{"interface", "ipv4", "delete", "dnsservers", "name=" + iface, "all"},
+				{"interface", "ip", "set", "dns", "name=" + iface, "source=dhcp"},
 			}
 		}
-		return false
+		if _, err := runNetshCommandVariants(clearCommands); err != nil {
+			return fmt.Errorf("clear dnsservers: %w", err)
+		}
+		return nil
 	}
-	return false
+
+	var setCommands [][]string
+	if ipv6 {
+		setCommands = [][]string{
+			{"interface", family, "set", "dnsservers", "name=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+			{"interface", family, "set", "dnsservers", "interface=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+		}
+	} else {
+		setCommands = [][]string{
+			{"interface", family, "set", "dnsservers", "name=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+			{"interface", "ip", "set", "dns", "name=" + iface, "static", desired[0], "primary"},
+		}
+	}
+	if _, err := runNetshCommandVariants(setCommands); err != nil {
+		return fmt.Errorf("set primary dnsserver: %w", err)
+	}
+
+	for idx, backup := range desired[1:] {
+		index := strconv.Itoa(idx + 2)
+		var addCommands [][]string
+		if ipv6 {
+			addCommands = [][]string{
+				{"interface", family, "add", "dnsservers", "name=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+				{"interface", family, "add", "dnsservers", "interface=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+			}
+		} else {
+			addCommands = [][]string{
+				{"interface", family, "add", "dnsservers", "name=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+				{"interface", "ip", "add", "dns", "name=" + iface, "addr=" + backup, "index=" + index},
+			}
+		}
+		if _, err := runNetshCommandVariants(addCommands); err != nil {
+			return fmt.Errorf("add secondary dnsserver %s: %w", backup, err)
+		}
+	}
+
+	return nil
+}
+
+func runNetshCommandVariants(variants [][]string) ([]byte, error) {
+	// Different Windows versions and adapter stacks accept slightly different
+	// netsh forms (e.g. ipv4 vs legacy ip context, name= vs interface=). Try
+	// variants in order and stop at the first successful command.
+	var lastErr error
+	for _, args := range variants {
+		cmd := exec.Command("netsh", args...)
+		hideWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+		lastErr = fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("no netsh command variant provided")
+	}
+	return nil, lastErr
 }
 
 // activeInterfaceNames returns the names of all enabled IPv4 network interfaces
