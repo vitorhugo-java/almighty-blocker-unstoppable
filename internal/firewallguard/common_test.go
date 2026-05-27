@@ -18,4 +18,3 @@ func TestStaleChunkIndexes(t *testing.T) {
 		t.Fatalf("unexpected stale indexes\nwant: %v\ngot:  %v", want, got)
 	}
 }
-
