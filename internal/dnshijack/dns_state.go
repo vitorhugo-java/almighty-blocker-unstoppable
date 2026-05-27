@@ -49,8 +49,13 @@ func parseDNSServers(output string, wantIPv6 bool) []string {
 	servers := make([]string, 0)
 	seen := map[string]struct{}{}
 
+	// netsh output is free-form and may vary by locale/version. We scan every
+	// whitespace token and keep only valid IP literals, which is resilient to
+	// label wording differences.
 	for _, token := range strings.Fields(output) {
 		candidate := strings.Trim(token, "[](){}<>,;\"'")
+		// netsh may print IPv6 link-local values with a zone id (e.g. fe80::1%14).
+		// Strip the zone suffix so net.ParseIP can normalize and compare values.
 		if idx := strings.Index(candidate, "%"); idx >= 0 {
 			candidate = candidate[:idx]
 		}

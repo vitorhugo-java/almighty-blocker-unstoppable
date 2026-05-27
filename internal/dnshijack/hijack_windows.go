@@ -101,6 +101,8 @@ func (g *Guard) enforce() error {
 		if errV6 != nil {
 			g.log.Debug("could not read IPv6 DNS for interface", "interface", iface, "error", errV6)
 		}
+		// Only skip remediation when both families are confirmed in the desired
+		// state. If any read fails, we treat it as potential drift and reapply.
 		readOK := errV4 == nil && errV6 == nil
 
 		if readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
@@ -226,6 +228,9 @@ func applyInterfaceDNS(iface string, desired []string, ipv6 bool) error {
 }
 
 func runNetshCommandVariants(variants [][]string) ([]byte, error) {
+	// Different Windows versions and adapter stacks accept slightly different
+	// netsh forms (e.g. ipv4 vs legacy ip context, name= vs interface=). Try
+	// variants in order and stop at the first successful command.
 	var lastErr error
 	for _, args := range variants {
 		cmd := exec.Command("netsh", args...)
