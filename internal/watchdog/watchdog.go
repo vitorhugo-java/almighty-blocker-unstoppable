@@ -164,9 +164,6 @@ func (w *Watchdog) ensurePartner() error {
 		if now.Before(w.pendingSpawnUntil) && w.processExists(w.pendingSpawnPID) {
 			return nil
 		}
-		if now.Before(w.pendingSpawnUntil) && partner == nil {
-			return nil
-		}
 		w.clearPendingSpawn()
 	}
 
@@ -245,7 +242,7 @@ func (w *Watchdog) lockPath(role Role) string {
 func (w *Watchdog) claimRoleLock() error {
 	lockPath := w.lockPath(w.Role)
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for retry := 0; retry < 2; retry++ {
 		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
 			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()))

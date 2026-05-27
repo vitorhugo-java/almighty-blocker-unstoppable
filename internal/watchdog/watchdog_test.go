@@ -113,9 +113,6 @@ func TestEnsurePartnerDoesNotRespawnAliveStalePartner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal returned error: %v", err)
 	}
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll returned error: %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(tempDir, "primary.json"), data, 0o644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
