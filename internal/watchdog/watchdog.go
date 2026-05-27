@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,7 @@ const (
 const (
 	heartbeatInterval = time.Second
 	staleAfter        = 3 * time.Second
+	startupGrace      = 6 * time.Second
 )
 
 type Watchdog struct {
@@ -30,6 +32,13 @@ type Watchdog struct {
 	StateDir          string
 	HeartbeatInterval time.Duration
 	StaleAfter        time.Duration
+	StartupGrace      time.Duration
+
+	spawnFunc         func(Role) (int, error)
+	processExistsFunc func(int) bool
+	nowFunc           func() time.Time
+	pendingSpawnPID   int
+	pendingSpawnUntil time.Time
 }
 
 type state struct {
@@ -54,6 +63,9 @@ func New(role Role, executablePath string, stateDir string) (*Watchdog, error) {
 		StateDir:          stateDir,
 		HeartbeatInterval: heartbeatInterval,
 		StaleAfter:        staleAfter,
+		StartupGrace:      startupGrace,
+		processExistsFunc: processExists,
+		nowFunc:           time.Now,
 	}, nil
 }
 
@@ -75,7 +87,10 @@ func (w *Watchdog) Run(ctx context.Context, workload func(context.Context) error
 	if err := w.claimRole(); err != nil {
 		return err
 	}
-	defer w.removeOwnState()
+	defer func() {
+		w.removeOwnState()
+		w.releaseRole()
+	}()
 
 	if err := w.writeOwnState(); err != nil {
 		return err
@@ -112,8 +127,13 @@ func (w *Watchdog) Run(ctx context.Context, workload func(context.Context) error
 }
 
 func (w *Watchdog) claimRole() error {
+	if err := w.claimRoleLock(); err != nil {
+		return err
+	}
+
 	current, err := w.readState(w.Role)
 	if err != nil {
+		w.releaseRole()
 		return err
 	}
 	if current == nil {
@@ -122,7 +142,8 @@ func (w *Watchdog) claimRole() error {
 	if current.PID == os.Getpid() {
 		return nil
 	}
-	if stateFresh(*current, w.StaleAfter) {
+	if w.processExists(current.PID) {
+		w.releaseRole()
 		return fmt.Errorf("%s process is already active with pid %d", w.Role, current.PID)
 	}
 	return nil
@@ -133,18 +154,43 @@ func (w *Watchdog) ensurePartner() error {
 	if err != nil {
 		return err
 	}
-	if partner != nil && stateFresh(*partner, w.StaleAfter) {
+	if partner != nil && w.processExists(partner.PID) {
+		w.clearPendingSpawn()
 		return nil
 	}
-	return w.spawn(w.PartnerRole)
+
+	now := w.now()
+	if w.pendingSpawnPID != 0 {
+		if now.Before(w.pendingSpawnUntil) && w.processExists(w.pendingSpawnPID) {
+			return nil
+		}
+		if now.Before(w.pendingSpawnUntil) && partner == nil {
+			return nil
+		}
+		w.clearPendingSpawn()
+	}
+
+	pid, err := w.spawn(w.PartnerRole)
+	if err != nil {
+		return err
+	}
+	w.pendingSpawnPID = pid
+	w.pendingSpawnUntil = now.Add(w.StartupGrace)
+	return nil
 }
 
-func (w *Watchdog) spawn(role Role) error {
+func (w *Watchdog) spawn(role Role) (int, error) {
+	if w.spawnFunc != nil {
+		return w.spawnFunc(role)
+	}
 	cmd := exec.Command(w.ExecutablePath, "--role="+string(role), "--state-dir="+w.StateDir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	configureSpawnCmd(cmd)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	return cmd.Process.Pid, nil
 }
 
 func (w *Watchdog) writeOwnState() error {
@@ -190,6 +236,83 @@ func (w *Watchdog) removeOwnState() {
 
 func (w *Watchdog) statePath(role Role) string {
 	return filepath.Join(w.StateDir, string(role)+".json")
+}
+
+func (w *Watchdog) lockPath(role Role) string {
+	return filepath.Join(w.StateDir, string(role)+".lock")
+}
+
+func (w *Watchdog) claimRoleLock() error {
+	lockPath := w.lockPath(w.Role)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()))
+			closeErr := f.Close()
+			if writeErr != nil {
+				_ = os.Remove(lockPath)
+				return writeErr
+			}
+			if closeErr != nil {
+				_ = os.Remove(lockPath)
+				return closeErr
+			}
+			return nil
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+
+		lockPID, readErr := readPIDFile(lockPath)
+		if readErr != nil || lockPID <= 0 || !w.processExists(lockPID) {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if lockPID == os.Getpid() {
+			return nil
+		}
+		return fmt.Errorf("%s process is already active with pid %d", w.Role, lockPID)
+	}
+
+	return fmt.Errorf("failed to claim %s role lock", w.Role)
+}
+
+func (w *Watchdog) releaseRole() {
+	lockPath := w.lockPath(w.Role)
+	lockPID, err := readPIDFile(lockPath)
+	if err != nil || lockPID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(lockPath)
+}
+
+func readPIDFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+func (w *Watchdog) processExists(pid int) bool {
+	if w.processExistsFunc != nil {
+		return w.processExistsFunc(pid)
+	}
+	return processExists(pid)
+}
+
+func (w *Watchdog) now() time.Time {
+	if w.nowFunc != nil {
+		return w.nowFunc()
+	}
+	return time.Now()
+}
+
+func (w *Watchdog) clearPendingSpawn() {
+	w.pendingSpawnPID = 0
+	w.pendingSpawnUntil = time.Time{}
 }
 
 func partnerRole(role Role) (Role, error) {
