@@ -141,13 +141,20 @@ func (g *Guard) enforce() error {
 }
 
 func interfaceDNSServers(iface string, ipv6 bool) ([]string, error) {
-	family := "ipv4"
+	var commands [][]string
 	if ipv6 {
-		family = "ipv6"
+		commands = [][]string{
+			{"interface", "ipv6", "show", "dnsservers", "name=" + iface},
+			{"interface", "ipv6", "show", "dnsservers", "interface=" + iface},
+		}
+	} else {
+		commands = [][]string{
+			{"interface", "ipv4", "show", "dnsservers", "name=" + iface},
+			{"interface", "ip", "show", "dns", "name=" + iface},
+		}
 	}
-	cmdShow := exec.Command("netsh", "interface", family, "show", "dnsservers", "name="+iface)
-	hideWindow(cmdShow)
-	out, err := cmdShow.Output()
+
+	out, err := runNetshCommandVariants(commands)
 	if err != nil {
 		return nil, err
 	}
@@ -161,38 +168,77 @@ func applyInterfaceDNS(iface string, desired []string, ipv6 bool) error {
 	}
 
 	if len(desired) == 0 {
-		clearCmd := exec.Command("netsh", "interface", family, "delete", "dnsservers", "name="+iface, "all")
-		hideWindow(clearCmd)
-		if out, err := clearCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("clear dnsservers: %w (%s)", err, strings.TrimSpace(string(out)))
+		var clearCommands [][]string
+		if ipv6 {
+			clearCommands = [][]string{
+				{"interface", "ipv6", "delete", "dnsservers", "name=" + iface, "all"},
+				{"interface", "ipv6", "delete", "dnsservers", "interface=" + iface, "all"},
+			}
+		} else {
+			clearCommands = [][]string{
+				{"interface", "ipv4", "delete", "dnsservers", "name=" + iface, "all"},
+				{"interface", "ip", "set", "dns", "name=" + iface, "source=dhcp"},
+			}
+		}
+		if _, err := runNetshCommandVariants(clearCommands); err != nil {
+			return fmt.Errorf("clear dnsservers: %w", err)
 		}
 		return nil
 	}
 
-	setCmd := exec.Command(
-		"netsh", "interface", family, "set", "dnsservers",
-		"name="+iface, "source=static", "address="+desired[0], "validate=no",
-	)
-	hideWindow(setCmd)
-	if out, err := setCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("set primary dnsserver: %w (%s)", err, strings.TrimSpace(string(out)))
+	var setCommands [][]string
+	if ipv6 {
+		setCommands = [][]string{
+			{"interface", family, "set", "dnsservers", "name=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+			{"interface", family, "set", "dnsservers", "interface=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+		}
+	} else {
+		setCommands = [][]string{
+			{"interface", family, "set", "dnsservers", "name=" + iface, "source=static", "address=" + desired[0], "validate=no"},
+			{"interface", "ip", "set", "dns", "name=" + iface, "static", desired[0], "primary"},
+		}
+	}
+	if _, err := runNetshCommandVariants(setCommands); err != nil {
+		return fmt.Errorf("set primary dnsserver: %w", err)
 	}
 
 	for idx, backup := range desired[1:] {
-		addCmd := exec.Command(
-			"netsh", "interface", family, "add", "dnsservers",
-			"name="+iface,
-			"address="+backup,
-			"index="+strconv.Itoa(idx+2),
-			"validate=no",
-		)
-		hideWindow(addCmd)
-		if out, err := addCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("add secondary dnsserver %s: %w (%s)", backup, err, strings.TrimSpace(string(out)))
+		index := strconv.Itoa(idx + 2)
+		var addCommands [][]string
+		if ipv6 {
+			addCommands = [][]string{
+				{"interface", family, "add", "dnsservers", "name=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+				{"interface", family, "add", "dnsservers", "interface=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+			}
+		} else {
+			addCommands = [][]string{
+				{"interface", family, "add", "dnsservers", "name=" + iface, "address=" + backup, "index=" + index, "validate=no"},
+				{"interface", "ip", "add", "dns", "name=" + iface, "addr=" + backup, "index=" + index},
+			}
+		}
+		if _, err := runNetshCommandVariants(addCommands); err != nil {
+			return fmt.Errorf("add secondary dnsserver %s: %w", backup, err)
 		}
 	}
 
 	return nil
+}
+
+func runNetshCommandVariants(variants [][]string) ([]byte, error) {
+	var lastErr error
+	for _, args := range variants {
+		cmd := exec.Command("netsh", args...)
+		hideWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return out, nil
+		}
+		lastErr = fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if lastErr == nil {
+		return nil, fmt.Errorf("no netsh command variant provided")
+	}
+	return nil, lastErr
 }
 
 // activeInterfaceNames returns the names of all enabled IPv4 network interfaces

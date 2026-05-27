@@ -58,7 +58,8 @@ func parseDNSServers(output string, wantIPv6 bool) []string {
 		if ip == nil {
 			continue
 		}
-		if (ip.To4() == nil) != wantIPv6 {
+		isIPv6 := ip.To4() == nil
+		if isIPv6 != wantIPv6 {
 			continue
 		}
 
