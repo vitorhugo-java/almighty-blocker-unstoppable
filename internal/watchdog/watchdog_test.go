@@ -48,7 +48,7 @@ func TestStateFresh(t *testing.T) {
 
 func TestClaimRoleFailsWhenLockOwnerIsAlive(t *testing.T) {
 	tempDir := t.TempDir()
-	wd, err := New(RolePrimary, "/tmp/bin", tempDir)
+	wd, err := New(RolePrimary, filepath.Join(tempDir, "bin"), tempDir)
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -65,7 +65,8 @@ func TestClaimRoleFailsWhenLockOwnerIsAlive(t *testing.T) {
 }
 
 func TestEnsurePartnerPreventsMultipleSpawnsDuringStartup(t *testing.T) {
-	wd, err := New(RolePrimary, "/tmp/bin", t.TempDir())
+	tempDir := t.TempDir()
+	wd, err := New(RolePrimary, filepath.Join(tempDir, "bin"), tempDir)
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
@@ -94,7 +95,7 @@ func TestEnsurePartnerPreventsMultipleSpawnsDuringStartup(t *testing.T) {
 
 func TestEnsurePartnerDoesNotRespawnAliveStalePartner(t *testing.T) {
 	tempDir := t.TempDir()
-	wd, err := New(RoleWatchdog, "/tmp/bin", tempDir)
+	wd, err := New(RoleWatchdog, filepath.Join(tempDir, "bin"), tempDir)
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)
 	}
