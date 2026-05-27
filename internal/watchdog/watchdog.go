@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,7 @@ const (
 	heartbeatInterval = time.Second
 	staleAfter        = 3 * time.Second
 	startupGrace      = 6 * time.Second
+	lockRetryAttempts = 2
 )
 
 type Watchdog struct {
@@ -37,6 +39,7 @@ type Watchdog struct {
 	spawnFunc         func(Role) (int, error)
 	processExistsFunc func(int) bool
 	nowFunc           func() time.Time
+	pendingSpawnMu    sync.Mutex
 	pendingSpawnPID   int
 	pendingSpawnUntil time.Time
 }
@@ -160,8 +163,9 @@ func (w *Watchdog) ensurePartner() error {
 	}
 
 	now := w.now()
-	if w.pendingSpawnPID != 0 {
-		if now.Before(w.pendingSpawnUntil) && w.processExists(w.pendingSpawnPID) {
+	pendingPID, pendingUntil := w.pendingSpawn()
+	if pendingPID != 0 {
+		if now.Before(pendingUntil) && w.processExists(pendingPID) {
 			return nil
 		}
 		w.clearPendingSpawn()
@@ -171,8 +175,7 @@ func (w *Watchdog) ensurePartner() error {
 	if err != nil {
 		return err
 	}
-	w.pendingSpawnPID = pid
-	w.pendingSpawnUntil = now.Add(w.StartupGrace)
+	w.setPendingSpawn(pid, now.Add(w.StartupGrace))
 	return nil
 }
 
@@ -242,7 +245,7 @@ func (w *Watchdog) lockPath(role Role) string {
 func (w *Watchdog) claimRoleLock() error {
 	lockPath := w.lockPath(w.Role)
 
-	for retry := 0; retry < 2; retry++ {
+	for retry := 0; retry < lockRetryAttempts; retry++ {
 		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
 			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()))
@@ -308,8 +311,23 @@ func (w *Watchdog) now() time.Time {
 }
 
 func (w *Watchdog) clearPendingSpawn() {
+	w.pendingSpawnMu.Lock()
+	defer w.pendingSpawnMu.Unlock()
 	w.pendingSpawnPID = 0
 	w.pendingSpawnUntil = time.Time{}
+}
+
+func (w *Watchdog) setPendingSpawn(pid int, until time.Time) {
+	w.pendingSpawnMu.Lock()
+	defer w.pendingSpawnMu.Unlock()
+	w.pendingSpawnPID = pid
+	w.pendingSpawnUntil = until
+}
+
+func (w *Watchdog) pendingSpawn() (int, time.Time) {
+	w.pendingSpawnMu.Lock()
+	defer w.pendingSpawnMu.Unlock()
+	return w.pendingSpawnPID, w.pendingSpawnUntil
 }
 
 func partnerRole(role Role) (Role, error) {
