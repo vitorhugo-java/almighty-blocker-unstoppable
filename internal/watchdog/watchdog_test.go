@@ -46,7 +46,7 @@ func TestStateFresh(t *testing.T) {
 	}
 }
 
-func TestClaimRoleUsesExplicitLock(t *testing.T) {
+func TestClaimRoleFailsWhenLockOwnerIsAlive(t *testing.T) {
 	tempDir := t.TempDir()
 	wd, err := New(RolePrimary, "/tmp/bin", tempDir)
 	if err != nil {
@@ -64,7 +64,7 @@ func TestClaimRoleUsesExplicitLock(t *testing.T) {
 	}
 }
 
-func TestEnsurePartnerSkipsDuplicateSpawnWhilePartnerStarts(t *testing.T) {
+func TestEnsurePartnerPreventsMultipleSpawnsDuringStartup(t *testing.T) {
 	wd, err := New(RolePrimary, "/tmp/bin", t.TempDir())
 	if err != nil {
 		t.Fatalf("New returned error: %v", err)

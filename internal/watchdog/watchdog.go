@@ -23,7 +23,9 @@ const (
 const (
 	heartbeatInterval = time.Second
 	staleAfter        = 3 * time.Second
-	startupGrace      = 6 * time.Second
+	// startupGrace is the maximum wait for a freshly spawned partner to publish heartbeat.
+	startupGrace = 6 * time.Second
+	// lockRetryAttempts retries lock acquisition once after stale lock cleanup.
 	lockRetryAttempts = 2
 )
 
@@ -245,7 +247,7 @@ func (w *Watchdog) lockPath(role Role) string {
 func (w *Watchdog) claimRoleLock() error {
 	lockPath := w.lockPath(w.Role)
 
-	for retry := 0; retry < lockRetryAttempts; retry++ {
+	for attempt := 0; attempt < lockRetryAttempts; attempt++ {
 		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
 			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()))
@@ -266,7 +268,9 @@ func (w *Watchdog) claimRoleLock() error {
 
 		lockPID, readErr := readPIDFile(lockPath)
 		if readErr != nil || lockPID <= 0 || !w.processExists(lockPID) {
-			_ = os.Remove(lockPath)
+			if removeErr := os.Remove(lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return removeErr
+			}
 			continue
 		}
 		if lockPID == os.Getpid() {
