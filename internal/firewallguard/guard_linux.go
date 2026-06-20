@@ -78,8 +78,10 @@ func (g *Guard) reconcileOnce() {
 	torIPs := append([]string(nil), g.torEntryIPs...)
 	g.mu.RUnlock()
 
-	resolved := resolveDomains(g.domains, g.dnsServers)
-	otherIPs := mergeIPs(g.manualIPs, resolved)
+	// Domain entries in blockAddress are filtered at DNS level (Cloudflare
+	// family DoH), not here: resolving them over plaintext :53 was hijackable
+	// and risked blocking shared/CDN IPs. Only literal IPs are firewalled.
+	otherIPs := mergeIPs(g.manualIPs)
 
 	if g.warnOnly {
 		if ok := g.rulesExist(); !ok {

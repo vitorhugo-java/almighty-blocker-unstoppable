@@ -24,6 +24,11 @@ import (
 // checkInterval is how often we inspect the DNS configuration.
 const checkInterval = 10 * time.Second
 
+// dohTemplate is the Cloudflare family (malware + adult) DNS-over-HTTPS endpoint.
+// Every configured DNS server IP is mapped to this template so Windows resolves
+// over encrypted HTTPS instead of hijackable plaintext UDP/TCP on port 53.
+const dohTemplate = "https://family.cloudflare-dns.com/dns-query"
+
 // Guard periodically verifies that every active network interface uses one of
 // the configured DNS servers as primary and restores it when changed.
 //
@@ -34,7 +39,11 @@ type Guard struct {
 	desiredV4 []string
 	desiredV6 []string
 	warnOnly  bool
-	mismatch  map[string]bool
+	// lastSeen maps an interface name to the signature of the last drifted DNS
+	// state we logged for it. Tracking the value (instead of a bool) lets us
+	// re-log every distinct change, which matters in warn-only/no-protection
+	// builds where we never remediate and reset the state.
+	lastSeen map[string]string
 }
 
 // New creates a new Guard instance.
@@ -49,7 +58,7 @@ func New(desired []string, warnOnly bool) *Guard {
 		desiredV4: v4,
 		desiredV6: v6,
 		warnOnly:  warnOnly,
-		mismatch:  map[string]bool{},
+		lastSeen:  map[string]string{},
 	}
 }
 
@@ -90,6 +99,10 @@ func (g *Guard) enforce() error {
 		return err
 	}
 
+	// Register the encrypted (DoH) endpoint for every desired server IP before
+	// applying them, so Windows auto-upgrades the adapters to DNS-over-HTTPS.
+	g.ensureDoHEncryption(append(append([]string{}, g.desiredV4...), g.desiredV6...))
+
 	var failed []string
 
 	for _, iface := range ifaces {
@@ -106,16 +119,18 @@ func (g *Guard) enforce() error {
 		readOK := errV4 == nil && errV6 == nil
 
 		if readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
-			if g.mismatch[iface] {
+			if _, drifted := g.lastSeen[iface]; drifted {
 				g.log.Info("DNS restored", "interface", iface)
-				g.mismatch[iface] = false
+				delete(g.lastSeen, iface)
 			}
 			continue
 		}
 
-		if !g.mismatch[iface] {
-			g.log.Warn("DNS change detected", "interface", iface)
-			g.mismatch[iface] = true
+		// Re-log on every distinct drift value, not just the first transition.
+		sig := strings.Join(append(append([]string{}, currentV4...), currentV6...), ",")
+		if g.lastSeen[iface] != sig {
+			g.log.Warn("DNS change detected", "interface", iface, "servers", sig)
+			g.lastSeen[iface] = sig
 		}
 		if g.warnOnly {
 			continue
@@ -134,7 +149,7 @@ func (g *Guard) enforce() error {
 		if interfaceFailed {
 			failed = append(failed, iface)
 		} else {
-			g.mismatch[iface] = false
+			delete(g.lastSeen, iface)
 		}
 	}
 	if len(failed) > 0 {
@@ -245,6 +260,37 @@ func runNetshCommandVariants(variants [][]string) ([]byte, error) {
 		return nil, fmt.Errorf("no netsh command variant provided")
 	}
 	return nil, lastErr
+}
+
+// ensureDoHEncryption maps each desired DNS server IP to the Cloudflare family
+// DoH template with strict, fallback-free auto-upgrade. These mappings are
+// global (keyed by server IP, not per interface), so configuring the IP as an
+// adapter's DNS server makes Windows resolve over HTTPS. udpfallback=no ensures
+// the resolver never silently downgrades to plaintext (and hijackable) DNS.
+func (g *Guard) ensureDoHEncryption(servers []string) {
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+
+		// Delete any stale mapping first; "add" fails if one already exists.
+		del := exec.Command("netsh", "dns", "delete", "encryption", "server="+server)
+		hideWindow(del)
+		_ = del.Run()
+
+		add := exec.Command(
+			"netsh", "dns", "add", "encryption",
+			"server="+server,
+			"dohtemplate="+dohTemplate,
+			"autoupgrade=yes",
+			"udpfallback=no",
+		)
+		hideWindow(add)
+		if out, err := add.CombinedOutput(); err != nil {
+			g.log.Error("failed to configure DoH encryption", "server", server, "error", err, "output", strings.TrimSpace(string(out)))
+		}
+	}
 }
 
 // activeInterfaceNames returns the names of all enabled IPv4 network interfaces

@@ -37,7 +37,11 @@ type Guard struct {
 	log      *slog.Logger
 	desired  []string
 	warnOnly bool
-	mismatch bool
+	// lastSeen holds the signature of the last drifted nameserver list we
+	// logged. Tracking the value (instead of a bool) lets us re-log every
+	// distinct change, which matters in warn-only/no-protection builds where we
+	// never remediate and reset the state.
+	lastSeen string
 }
 
 // New creates a new Guard instance.
@@ -92,16 +96,18 @@ func (g *Guard) enforce() error {
 
 	currentServers := parseResolvNameservers(current)
 	if sameServerList(currentServers, g.desired) {
-		if g.mismatch {
+		if g.lastSeen != "" {
 			g.log.Info("DNS restored", "path", resolvConf)
-			g.mismatch = false
+			g.lastSeen = ""
 		}
 		return nil // Already correct – nothing to do.
 	}
 
-	if !g.mismatch {
-		g.log.Warn("DNS change detected in " + resolvConf)
-		g.mismatch = true
+	// Re-log on every distinct drift value, not just the first transition.
+	sig := strings.Join(currentServers, ",")
+	if g.lastSeen != sig {
+		g.log.Warn("DNS change detected", "path", resolvConf, "servers", sig)
+		g.lastSeen = sig
 	}
 	if g.warnOnly {
 		return nil
@@ -152,7 +158,7 @@ func (g *Guard) enforce() error {
 		return fmt.Errorf("rename temp resolv.conf: %w", err)
 	}
 
-	g.mismatch = false
+	g.lastSeen = ""
 
 	return nil
 }

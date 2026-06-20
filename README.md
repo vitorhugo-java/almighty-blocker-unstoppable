@@ -35,17 +35,21 @@ go run ./cmd/build -refresh-tor-ips -tor-ip-limit 1500 -no-protection
 Fields:
 - `sources`: list of remote URLs to fetch plain text block lists from.
 - `files`: list of local file paths to include when building the embedded blocklist.
-- `DNS`: list of external DNS servers to enforce on the host adapters (for example `"1.1.1.1"`, `"1.0.0.1"`).
+- `DNS`: list of external DNS servers to enforce on the host adapters. Both IPv4 and IPv6 entries are supported and enforced per family. Default is Cloudflare *family* filtering (malware + adult): `1.1.1.3`/`1.0.0.3` and their IPv6 equivalents `2606:4700:4700::1113`/`2606:4700:4700::1003`.
 - `upstreamDNS`: legacy compatibility field. If `DNS` is omitted, values from `upstreamDNS` are used when possible.
-- `torEntryIPs`: optional list of IPv4 addresses of Tor guard/entry nodes to block at the network level. See [Managing torEntryIPs](#managing-torentryips) for how to populate this list.
-- `blockAddress`: optional manual block list. Accepts domains and IPs. IPs are blocked directly by firewall. Domains are periodically resolved and resulting IPs are blocked by firewall.
+- `torEntryIPs`: optional list of IPv4/IPv6 addresses of Tor guard/entry nodes to block at the network level. See [Managing torEntryIPs](#managing-torentryips) for how to populate this list.
+- `blockAddress`: optional manual block list. Accepts domains and IPs. **Literal IPs** are blocked directly by firewall. **Domains** are *not* firewalled — they are blocked at DNS level by the Cloudflare family DoH resolver (e.g. `xvideos.com` resolves to `0.0.0.0`). Resolving domains to IPs at the firewall was removed because plaintext `:53` lookups are hijackable and could block shared/CDN IPs, breaking unrelated internet access.
+
+On **Windows 11** every configured DNS server IP is mapped to the Cloudflare family DNS-over-HTTPS endpoint (`https://family.cloudflare-dns.com/dns-query`) with strict, fallback-free auto-upgrade (`netsh dns add encryption ... autoupgrade=yes udpfallback=no`), so resolution is always encrypted and cannot be downgraded to plaintext. On Linux, DoH depends on the host resolver stack (systemd-resolved/NetworkManager) and is not configured by this service.
 
 Example `DNS`:
 
 ```json
 [
-  "1.1.1.1",
-  "1.0.0.1"
+  "1.1.1.3",
+  "1.0.0.3",
+  "2606:4700:4700::1113",
+  "2606:4700:4700::1003"
 ]
 ```
 
