@@ -61,6 +61,11 @@ func windowsServiceExists(serviceName string) (bool, error) {
 	return false, fmt.Errorf("query service %q: %w (%s)", serviceName, err, strings.TrimSpace(string(output)))
 }
 
+// createNoWindow (CREATE_NO_WINDOW) prevents Windows from allocating a console
+// for child processes (sc.exe here), so the protected GUI build never flashes a
+// terminal window while registering the service.
+const createNoWindow = 0x08000000
+
 func hideWindow(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 }

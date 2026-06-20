@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows/registry"
+
 	"almighty-blocker-unstoppable/internal/logger"
 )
 
@@ -103,6 +105,10 @@ func (g *Guard) enforce() error {
 	// applying them, so Windows auto-upgrades the adapters to DNS-over-HTTPS.
 	g.ensureDoHEncryption(append(append([]string{}, g.desiredV4...), g.desiredV6...))
 
+	// Resolve adapter friendly-name → interface GUID so we can read/write the
+	// per-adapter DoH registry settings below.
+	guidByName := interfaceGUIDs()
+
 	var failed []string
 
 	for _, iface := range ifaces {
@@ -117,8 +123,16 @@ func (g *Guard) enforce() error {
 		// Only skip remediation when both families are confirmed in the desired
 		// state. If any read fails, we treat it as potential drift and reapply.
 		readOK := errV4 == nil && errV6 == nil
+		dnsOK := readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6)
 
-		if readOK && sameServerList(currentV4, g.desiredV4) && sameServerList(currentV6, g.desiredV6) {
+		// Per-adapter DoH is what actually upgrades resolution to HTTPS. The
+		// global encryption mapping (ensureDoHEncryption) only advertises that
+		// the server supports DoH; without the per-interface DohFlags the client
+		// keeps resolving over plaintext UDP/TCP.
+		guid := guidByName[strings.ToLower(iface)]
+		dohMissing := guid != "" && g.interfaceDoHMissing(guid)
+
+		if dnsOK && !dohMissing {
 			if _, drifted := g.lastSeen[iface]; drifted {
 				g.log.Info("DNS restored", "interface", iface)
 				delete(g.lastSeen, iface)
@@ -126,14 +140,26 @@ func (g *Guard) enforce() error {
 			continue
 		}
 
-		// Re-log on every distinct drift value, not just the first transition.
-		sig := strings.Join(append(append([]string{}, currentV4...), currentV6...), ",")
-		if g.lastSeen[iface] != sig {
-			g.log.Warn("DNS change detected", "interface", iface, "servers", sig)
-			g.lastSeen[iface] = sig
+		if !dnsOK {
+			// Re-log on every distinct drift value, not just the first transition.
+			sig := strings.Join(append(append([]string{}, currentV4...), currentV6...), ",")
+			if g.lastSeen[iface] != sig {
+				g.log.Warn("DNS change detected", "interface", iface, "servers", sig)
+				g.lastSeen[iface] = sig
+			}
+		} else if dohMissing {
+			g.log.Warn("DoH not active on interface", "interface", iface)
 		}
+
 		if g.warnOnly {
 			continue
+		}
+
+		// Write the per-adapter DoH registry first, then (re)apply the DNS
+		// servers so the DNS client reloads the interface configuration and
+		// starts resolving over HTTPS.
+		if guid != "" && dohMissing {
+			g.applyInterfaceDoH(guid)
 		}
 
 		interfaceFailed := false
@@ -293,6 +319,119 @@ func (g *Guard) ensureDoHEncryption(servers []string) {
 	}
 }
 
+// dohEncryptionRequired is the DohFlags value meaning "encrypted only": Windows
+// resolves over DoH and never falls back to plaintext DNS. It matches the strict
+// udpfallback=no policy registered by ensureDoHEncryption. (DohFlags=1 would
+// allow UDP fallback.)
+const dohEncryptionRequired = 2
+
+// dohRegPath returns the per-interface DoH registry path for the given adapter
+// GUID. IPv4 servers live under "Doh", IPv6 servers under "Doh6".
+func dohRegPath(guid string, ipv6 bool) string {
+	sub := "Doh"
+	if ipv6 {
+		sub = "Doh6"
+	}
+	return `SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\` + guid + `\DohInterfaceSettings\` + sub
+}
+
+// dohFamilies pairs each desired server family with its IPv6 flag.
+func (g *Guard) dohFamilies() []struct {
+	servers []string
+	ipv6    bool
+} {
+	return []struct {
+		servers []string
+		ipv6    bool
+	}{
+		{g.desiredV4, false},
+		{g.desiredV6, true},
+	}
+}
+
+// interfaceDoHMissing reports whether any desired server lacks an "encrypted
+// only" DoH entry on the given adapter. It is read-only and is used in both
+// enforcing and warn-only modes to detect drift before deciding to remediate.
+func (g *Guard) interfaceDoHMissing(guid string) bool {
+	for _, fam := range g.dohFamilies() {
+		base := dohRegPath(guid, fam.ipv6)
+		for _, server := range fam.servers {
+			server = strings.TrimSpace(server)
+			if server == "" {
+				continue
+			}
+			key, err := registry.OpenKey(registry.LOCAL_MACHINE, base+`\`+server, registry.QUERY_VALUE)
+			if err != nil {
+				return true
+			}
+			val, _, err := key.GetIntegerValue("DohFlags")
+			key.Close()
+			if err != nil || val != dohEncryptionRequired {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyInterfaceDoH writes the per-adapter DoH registry entries (DohFlags =
+// encrypted only) for every desired server. The encrypted template itself comes
+// from the global auto-upgrade mapping registered by ensureDoHEncryption, so the
+// interface key only needs the flag. Requires Administrator/SYSTEM (HKLM write).
+func (g *Guard) applyInterfaceDoH(guid string) {
+	for _, fam := range g.dohFamilies() {
+		base := dohRegPath(guid, fam.ipv6)
+		for _, server := range fam.servers {
+			server = strings.TrimSpace(server)
+			if server == "" {
+				continue
+			}
+			key, _, err := registry.CreateKey(registry.LOCAL_MACHINE, base+`\`+server, registry.SET_VALUE)
+			if err != nil {
+				g.log.Error("failed to open DoH interface key", "guid", guid, "server", server, "error", err)
+				continue
+			}
+			if err := key.SetQWordValue("DohFlags", dohEncryptionRequired); err != nil {
+				g.log.Error("failed to set DohFlags", "guid", guid, "server", server, "error", err)
+			}
+			key.Close()
+		}
+	}
+}
+
+// interfaceGUIDs maps each network adapter's friendly name (lower-cased) to its
+// interface GUID by reading the network class registry key. The GUID is the same
+// identifier used under Dnscache\InterfaceSpecificParameters. Best-effort: on any
+// read error the (possibly partial) map is returned.
+func interfaceGUIDs() map[string]string {
+	const netClass = `SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}`
+
+	result := map[string]string{}
+	root, err := registry.OpenKey(registry.LOCAL_MACHINE, netClass, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return result
+	}
+	defer root.Close()
+
+	guids, err := root.ReadSubKeyNames(-1)
+	if err != nil {
+		return result
+	}
+	for _, guid := range guids {
+		conn, err := registry.OpenKey(registry.LOCAL_MACHINE, netClass+`\`+guid+`\Connection`, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		name, _, err := conn.GetStringValue("Name")
+		conn.Close()
+		if err != nil || name == "" {
+			continue
+		}
+		result[strings.ToLower(name)] = guid
+	}
+	return result
+}
+
 // activeInterfaceNames returns the names of all enabled IPv4 network interfaces
 // by parsing the output of "netsh interface show interface".
 func activeInterfaceNames() ([]string, error) {
@@ -336,6 +475,11 @@ func activeInterfaceNames() ([]string, error) {
 	return names, nil
 }
 
+// createNoWindow (CREATE_NO_WINDOW) keeps every netsh invocation from ever
+// allocating a console, so the protected GUI build performs its DNS checks
+// without flashing a terminal window.
+const createNoWindow = 0x08000000
+
 func hideWindow(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 }

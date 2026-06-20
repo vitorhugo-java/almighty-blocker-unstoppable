@@ -93,10 +93,18 @@ func (g *Guard) reconcileOnce() {
 	torChunks := splitIPChunksByFamily(torIPs, chunkSize)
 	otherChunks := splitIPChunksByFamily(otherIPs, chunkSize)
 
+	// reconcile reads each rule's current remoteip set and compares it to the
+	// desired one. In enforcement mode it rewrites only the rules that drifted
+	// (instead of blindly re-adding every rule each tick); in warn-only mode it
+	// reports drift without modifying anything.
+	otherDrift := g.reconcile(windowsRulePrefix, otherChunks)
+	torDrift := g.reconcile(windowsTorRulePrefix, torChunks)
+	drift := otherDrift || torDrift
+
 	if g.warnOnly {
-		if ok := g.rulesExist(windowsRulePrefix, otherChunks) && g.rulesExist(windowsTorRulePrefix, torChunks); !ok {
+		if drift {
 			if !g.missing {
-				g.log.Warn("firewall rules missing or changed")
+				g.log.Warn("firewall change detected")
 				g.missing = true
 			}
 		} else if g.missing {
@@ -106,59 +114,157 @@ func (g *Guard) reconcileOnce() {
 		return
 	}
 
-	g.missing = false
-	g.applyWindowsRules(windowsRulePrefix, otherChunks)
-	g.applyWindowsRules(windowsTorRulePrefix, torChunks)
-}
-
-func (g *Guard) rulesExist(prefix string, chunks [][]string) bool {
-	for idx := range chunks {
-		ruleName := prefix + " #" + strconv.Itoa(idx+1)
-		cmd := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name="+ruleName)
-		hideWindow(cmd)
-		if err := cmd.Run(); err != nil {
-			return false
-		}
+	if drift {
+		g.log.Warn("firewall change detected")
 	}
-	return true
+	g.missing = false
 }
 
-func (g *Guard) applyWindowsRules(prefix string, chunks [][]string) {
+// reconcile compares every chunk rule against the desired remote-IP set and,
+// when enforcing, repairs only the rules that drifted. It returns whether any
+// drift (missing rule or changed remoteip set) was observed.
+func (g *Guard) reconcile(prefix string, chunks [][]string) bool {
+	drift := false
 	for idx, chunk := range chunks {
 		ruleName := prefix + " #" + strconv.Itoa(idx+1)
-		cmdDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
-		hideWindow(cmdDel)
-		_ = cmdDel.Run()
+		actual, exists := g.ruleRemoteIPs(ruleName)
+		if exists && setsEqual(actual, ipSet(chunk)) {
+			continue
+		}
+		drift = true
+		if g.warnOnly {
+			continue
+		}
+		g.writeRule(ruleName, chunk)
+	}
+	if !g.warnOnly {
+		g.cleanupStaleChunks(prefix, len(chunks))
+	}
+	return drift
+}
 
-		remote := strings.Join(chunk, ",")
-		cmd := exec.Command(
-			"netsh", "advfirewall", "firewall", "add", "rule",
-			"name="+ruleName,
-			"dir=out",
-			"action=block",
-			"enable=yes",
-			"profile=any",
-			"remoteip="+remote,
-		)
-		hideWindow(cmd)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			g.log.Error("failed to apply firewall rule", "rule", ruleName, "error", err, "output", strings.TrimSpace(string(out)))
+// ruleRemoteIPs returns the normalized set of remote IPs currently configured on
+// the named firewall rule. The bool is false when the rule does not exist.
+func (g *Guard) ruleRemoteIPs(ruleName string) (map[string]struct{}, bool) {
+	cmd := exec.Command("netsh", "advfirewall", "firewall", "show", "rule", "name="+ruleName, "verbose")
+	hideWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Non-zero exit means no rule matched the name.
+		return nil, false
+	}
+
+	set := make(map[string]struct{})
+	capturing := false
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RemoteIP:") {
+			capturing = true
+			addRuleIPs(set, strings.TrimSpace(strings.TrimPrefix(trimmed, "RemoteIP:")))
+			continue
+		}
+		if capturing {
+			// netsh wraps multi-value fields onto indented continuation lines
+			// (which carry no column-0 label). Indentation — not the presence of
+			// ':' — distinguishes them, so IPv6 values are handled correctly.
+			if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+				addRuleIPs(set, trimmed)
+				continue
+			}
+			capturing = false
 		}
 	}
+	return set, true
+}
 
+// writeRule replaces a single numbered chunk rule with the desired remote IPs.
+func (g *Guard) writeRule(ruleName string, chunk []string) {
+	cmdDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
+	hideWindow(cmdDel)
+	_ = cmdDel.Run()
+
+	remote := strings.Join(chunk, ",")
+	cmd := exec.Command(
+		"netsh", "advfirewall", "firewall", "add", "rule",
+		"name="+ruleName,
+		"dir=out",
+		"action=block",
+		"enable=yes",
+		"profile=any",
+		"remoteip="+remote,
+	)
+	hideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		g.log.Error("failed to apply firewall rule", "rule", ruleName, "error", err, "output", strings.TrimSpace(string(out)))
+	}
+}
+
+// cleanupStaleChunks removes numbered rules left over from a previous refresh
+// that used more chunks than the current one.
+func (g *Guard) cleanupStaleChunks(prefix string, current int) {
 	previous, known := g.lastChunks[prefix]
 	if !known {
-		previous = len(chunks) + initialStaleSweep
+		previous = current + initialStaleSweep
 	}
-
-	// Remove stale chunk rules left from previous refreshes.
-	for _, i := range staleChunkIndexes(previous, len(chunks)) {
+	for _, i := range staleChunkIndexes(previous, current) {
 		ruleName := prefix + " #" + strconv.Itoa(i)
 		cmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 		hideWindow(cmd)
 		_ = cmd.Run()
 	}
-	g.lastChunks[prefix] = len(chunks)
+	g.lastChunks[prefix] = current
+}
+
+// addRuleIPs splits a (possibly comma-separated) netsh remoteip value and adds
+// each normalized IP to set.
+func addRuleIPs(set map[string]struct{}, value string) {
+	for _, part := range strings.Split(value, ",") {
+		if ip := normalizeRuleIP(part); ip != "" {
+			set[ip] = struct{}{}
+		}
+	}
+}
+
+// normalizeRuleIP canonicalizes a single netsh remoteip token so that values
+// such as "1.2.3.4/32" and "1.2.3.4" (or differently-cased IPv6) compare equal.
+func normalizeRuleIP(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	// Strip single-host CIDR suffixes that netsh appends to literal IPs.
+	if i := strings.IndexByte(token, '/'); i >= 0 {
+		if suffix := token[i+1:]; suffix == "32" || suffix == "128" {
+			token = token[:i]
+		}
+	}
+	if ip := net.ParseIP(token); ip != nil {
+		return ip.String()
+	}
+	return token
+}
+
+// ipSet builds a normalized set from a desired chunk of IPs.
+func ipSet(items []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if ip := normalizeRuleIP(item); ip != "" {
+			set[ip] = struct{}{}
+		}
+	}
+	return set
+}
+
+func setsEqual(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func splitIPChunksByFamily(in []string, size int) [][]string {
@@ -185,6 +291,11 @@ func splitIPChunksByFamily(in []string, size int) [][]string {
 	return chunks
 }
 
+// createNoWindow (CREATE_NO_WINDOW) keeps every netsh invocation from ever
+// allocating a console, so the protected GUI build performs its firewall checks
+// without flashing a terminal window.
+const createNoWindow = 0x08000000
+
 func hideWindow(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 }
