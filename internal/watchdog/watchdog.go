@@ -229,7 +229,31 @@ func (w *Watchdog) writeOwnState() error {
 		return err
 	}
 
-	return os.WriteFile(w.statePath(w.Role), data, 0o644)
+	// Write to a temp file in the same directory and rename it over the target.
+	// rename(2) (and MoveFileEx on Windows) is atomic, so the partner role never
+	// observes a half-written heartbeat. A torn read would otherwise fail JSON
+	// decoding and trigger a spurious "stale partner" restart.
+	tmp, err := os.CreateTemp(w.StateDir, "."+string(w.Role)+".json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	if err := os.Rename(tmpName, w.statePath(w.Role)); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (w *Watchdog) readState(role Role) (*state, error) {

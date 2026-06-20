@@ -3,9 +3,12 @@
 Almighty Blocker is a small daemon that continuously enforces a curated set of host redirects on the local machine and protects that configuration with an optional watchdog and self-defence features.
 
 Key ideas:
-- An embedded block list (generated at build time) is enforced inside the system hosts file between
-  two markers: `# >>> almighty-blocker-unstoppable >>>` and `# <<< almighty-blocker-unstoppable <<<`.
+- Blocking is enforced at two layers: encrypted DNS (the configured Cloudflare *family* resolvers
+  filter malware/adult domains, and `blockAddress` domains resolve to `0.0.0.0`) and the host
+  firewall (literal IPs from `torEntryIPs` and `blockAddress` are blocked outbound).
 - The daemon enforces configured external DNS servers on active interfaces and monitors for tampering.
+- Note: direct system hosts-file enforcement is not active in the current build. `cmd/build` still
+  embeds a blocklist constant (`generated_hosts.go`), but it is reserved and not consumed at runtime.
 - A primary/watchdog pair provides automatic restart: the primary does the work, the watchdog monitors its heartbeat and restarts it if it crashes.
 - Self-defence (camouflage, DNS guard, automatic service/unit registration) is compiled in by default. To disable these features build with the `noprotection` tag.
 
@@ -91,7 +94,7 @@ Flags:
 
 When protection is enabled (default build):
 - The primary enforces configured DNS servers on the OS network interfaces.
-- The primary applies firewall blocks from `torEntryIPs` and `blockAddress` (IPs directly, domains via resolved IPs).
+- The primary applies firewall blocks for the literal IPs in `torEntryIPs` and `blockAddress`. Domains in `blockAddress` are blocked at DNS level (Cloudflare family DoH), not firewalled. Both IPv4 and IPv6 IPs are enforced (iptables/ip6tables on Linux, per-family netsh rules on Windows).
 - Tor IPs are reconciled continuously: new Onionoo IPs are added and removed IPs are cleaned automatically from Tor-labeled firewall rules.
 - A watchdog process monitors the primary through heartbeat files in `--state-dir`. The watchdog may spawn or restart the primary when needed.
 
@@ -113,10 +116,10 @@ Note: service registration requires administrative privileges.
 
 ## Developer notes
 
-- The blocklist is embedded into the binary by `cmd/build` and consumed via `redirects.ParseLines` at runtime. If `lines` is empty the process exits with an error advising to run the build step.
+- Runtime configuration (`env.json`) is embedded into the binary by `cmd/build` as `generated_env.go` and loaded from memory at startup; there is no external config dependency after build.
+- `cmd/build` also embeds a blocklist constant (`generated_hosts.go`) from the configured `sources`/`files`, but it is currently inert — hosts-file enforcement is disabled, so the constant is not read at runtime.
 - DNS enforcement uses `internal/dnshijack` and firewall enforcement uses `internal/firewallguard`.
 - Camouflage randomizes process/service display name on supported platforms. This is a compile-time-enabled feature and can be removed by building with the `noprotection` tag.
-- Markers used when editing the hosts file are constants defined in `main.go` (begin and end markers). Do not modify other hosts entries outside these markers.
 
 ## Troubleshooting
 

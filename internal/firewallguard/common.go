@@ -66,6 +66,24 @@ func dedupeSorted(in []string) []string {
 	return out
 }
 
+// splitIPsByFamily partitions normalized IPs into IPv4 and IPv6 buckets so each
+// family can be enforced with the matching tooling (iptables/ip6tables on Linux,
+// netsh remoteip chunks on Windows). Non-IP entries are dropped.
+func splitIPsByFamily(in []string) (v4 []string, v6 []string) {
+	for _, item := range in {
+		ip := net.ParseIP(strings.TrimSpace(item))
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			v4 = append(v4, ip.String())
+			continue
+		}
+		v6 = append(v6, ip.String())
+	}
+	return v4, v6
+}
+
 func splitChunks(in []string, size int) [][]string {
 	if len(in) == 0 || size <= 0 {
 		return nil

@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -432,39 +433,32 @@ func interfaceGUIDs() map[string]string {
 	return result
 }
 
-// activeInterfaceNames returns the names of all enabled IPv4 network interfaces
-// by parsing the output of "netsh interface show interface".
+// activeInterfaceNames returns the friendly names of all operationally-up,
+// non-loopback network interfaces. It uses net.Interfaces() (which maps to the
+// Win32 adapter table) instead of parsing "netsh interface show interface",
+// because that command's output is localized: on non-English Windows the
+// "Enabled"/"Connected" status words differ and the old string match silently
+// returned no interfaces, disabling DNS enforcement entirely. The friendly name
+// returned here (e.g. "Ethernet", "Wi-Fi") is what netsh accepts as name=.
 func activeInterfaceNames() ([]string, error) {
-	// The output looks like:
-	//   Admin State    State          Type             Interface Name
-	//   -------------------------------------------------------------------------
-	//   Enabled        Connected      Dedicated        Ethernet
-	//   Enabled        Connected      Dedicated        Wi-Fi
-	cmd := exec.Command("netsh", "interface", "show", "interface")
-	hideWindow(cmd)
-	out, err := cmd.Output()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
 	var names []string
-	for _, line := range strings.Split(string(out), "\n") {
-		// Only process lines that describe an "Enabled" and "Connected" interface.
-		if !strings.Contains(line, "Enabled") || !strings.Contains(line, "Connected") {
+	for _, iface := range ifaces {
+		// FlagUp reflects the operational up state (IfOperStatusUp) on Windows,
+		// so disconnected adapters are skipped just like the old "Connected" check.
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
-		// The interface name starts after the last run of spaces following the type column.
-		// We split the line into fields and use everything from field index 3 onward.
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		// Rejoin remaining fields in case the interface name contains spaces.
-		name := strings.TrimSpace(strings.Join(fields[3:], " "))
-
-		// Skip loopback – no need to set DNS on the loopback adapter itself.
-		if strings.EqualFold(name, "Loopback Pseudo-Interface 1") {
+		name := strings.TrimSpace(iface.Name)
+		if name == "" {
 			continue
 		}
 		if strings.Contains(strings.ToLower(name), "zerotier") {

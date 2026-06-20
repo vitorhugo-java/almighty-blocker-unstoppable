@@ -112,8 +112,11 @@ func runApplication(ctx context.Context, roleValue string, stateDir string, serv
 		torEntryIPs = cfg.TorEntryIPs
 	}
 
-	// Always try to apply DNS/firewall baseline once at startup.
-	// In no-protection builds we still apply once, then switch to warn-only monitor mode.
+	// Always apply the DNS/firewall baseline once at startup with a dedicated
+	// enforcing applier. In no-protection builds the continuous guards below run
+	// in warn-only mode, so this one-shot is what actually applies the config
+	// once before monitoring begins. These appliers are used only here, before
+	// any guard goroutine starts, so they never write concurrently with fwGuard.
 	dnsApply := dnshijack.New(dnsServers, false)
 	if err := dnsApply.EnforceOnce(); err != nil {
 		log.Printf("warning: initial DNS configuration failed: %v", err)
@@ -134,10 +137,14 @@ func runApplication(ctx context.Context, roleValue string, stateDir string, serv
 			torRefreshInterval,
 			0,
 			slog.Default().With("component", "tor-fetch"),
+			// Route runtime Tor IP updates through the single continuous guard so
+			// that fwGuard is the only writer of the firewall rules after startup.
+			// Sharing one instance means its reconcile mutex serialises these
+			// refresh-driven applies with the periodic Run loop, instead of two
+			// separate Guards racing to rewrite the same rule names.
 			func(next []string) {
-				fwApply.SetTorEntryIPs(next)
 				fwGuard.SetTorEntryIPs(next)
-				fwApply.RunOnce()
+				fwGuard.RunOnce()
 			},
 		)
 

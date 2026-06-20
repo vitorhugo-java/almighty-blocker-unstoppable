@@ -1,7 +1,6 @@
 package redirects
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"go/format"
@@ -9,8 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -218,63 +215,6 @@ func BuildManagedContent(existing string, redirects []string, beginMarker string
 	default:
 		return "", fmt.Errorf("hosts file contains an incomplete managed block")
 	}
-}
-
-func HostsPath() (string, error) {
-	switch runtime.GOOS {
-	case "windows":
-		root := os.Getenv("SystemRoot")
-		if strings.TrimSpace(root) == "" {
-			root = `C:\Windows`
-		}
-		return filepath.Join(root, "System32", "drivers", "etc", "hosts"), nil
-	case "linux":
-		return "/etc/hosts", nil
-	default:
-		return "", fmt.Errorf("unsupported operating system %q", runtime.GOOS)
-	}
-}
-
-func EnforceHostsLoop(ctx context.Context, path string, lines []string, beginMarker string, endMarker string) error {
-	if err := enforceHosts(path, lines, beginMarker, endMarker); err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			if err := enforceHosts(path, lines, beginMarker, endMarker); err != nil {
-				return err
-			}
-		}
-	}
-}
-
-func enforceHosts(path string, lines []string, beginMarker string, endMarker string) error {
-	current, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	updated, err := BuildManagedContent(string(current), lines, beginMarker, endMarker)
-	if err != nil {
-		return err
-	}
-	if updated == string(current) {
-		return nil
-	}
-
-	mode := os.FileMode(0o644)
-	if info, statErr := os.Stat(path); statErr == nil {
-		mode = info.Mode()
-	}
-
-	return os.WriteFile(path, []byte(updated), mode)
 }
 
 func GenerateGoSource(packageName string, constName string, value string) ([]byte, error) {

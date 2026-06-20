@@ -15,10 +15,30 @@ import (
 
 const (
 	ipsetName      = "almighty_block_ips"
+	ipsetName6     = "almighty_block_ips6"
 	torIPSetName   = "almighty_block_tor_ips"
+	torIPSetName6  = "almighty_block_tor_ips6"
 	checkInterval  = 15 * time.Second
 	torRuleComment = "almighty-blocker-tor"
 )
+
+// linuxFamily bundles the per-address-family tooling so that the same
+// reconciliation logic can enforce IPv4 (iptables/inet ipset) and IPv6
+// (ip6tables/inet6 ipset) without duplicating code. Without the IPv6 family,
+// IPv6 Tor guard and manual IPs would be fetched but never actually blocked.
+type linuxFamily struct {
+	iptables  string // "iptables" or "ip6tables"
+	inet      string // ipset family: "inet" or "inet6"
+	manualSet string
+	torSet    string
+}
+
+func linuxFamilies() []linuxFamily {
+	return []linuxFamily{
+		{iptables: "iptables", inet: "inet", manualSet: ipsetName, torSet: torIPSetName},
+		{iptables: "ip6tables", inet: "inet6", manualSet: ipsetName6, torSet: torIPSetName6},
+	}
+}
 
 type Guard struct {
 	log         *slog.Logger
@@ -101,57 +121,76 @@ func (g *Guard) reconcileOnce() {
 }
 
 func (g *Guard) rulesExist() bool {
-	if err := exec.Command("ipset", "list", ipsetName).Run(); err != nil {
-		return false
-	}
-	if err := exec.Command("ipset", "list", torIPSetName).Run(); err != nil {
-		return false
-	}
-	if err := exec.Command("iptables", "-C", "OUTPUT", "-m", "set", "--match-set", ipsetName, "dst", "-j", "REJECT").Run(); err != nil {
-		return false
-	}
-	if err := exec.Command("iptables", "-C", "OUTPUT", "-m", "comment", "--comment", torRuleComment, "-m", "set", "--match-set", torIPSetName, "dst", "-j", "REJECT").Run(); err != nil {
-		return false
+	for _, fam := range linuxFamilies() {
+		if err := exec.Command("ipset", "list", fam.manualSet).Run(); err != nil {
+			return false
+		}
+		if err := exec.Command("ipset", "list", fam.torSet).Run(); err != nil {
+			return false
+		}
+		if err := exec.Command(fam.iptables, "-C", "OUTPUT", "-m", "set", "--match-set", fam.manualSet, "dst", "-j", "REJECT").Run(); err != nil {
+			return false
+		}
+		if err := exec.Command(fam.iptables, "-C", "OUTPUT", "-m", "comment", "--comment", torRuleComment, "-m", "set", "--match-set", fam.torSet, "dst", "-j", "REJECT").Run(); err != nil {
+			return false
+		}
 	}
 	return true
 }
 
 func (g *Guard) applyLinuxRules(torIPs []string, otherIPs []string) {
-	applySet := func(setName string, ips []string) bool {
-		if out, err := exec.Command("ipset", "create", setName, "hash:ip", "-exist").CombinedOutput(); err != nil {
-			g.log.Error("failed to create ipset", "set", setName, "error", err, "output", strings.TrimSpace(string(out)))
-			return false
-		}
-		if out, err := exec.Command("ipset", "flush", setName).CombinedOutput(); err != nil {
-			g.log.Error("failed to flush ipset", "set", setName, "error", err, "output", strings.TrimSpace(string(out)))
-			return false
-		}
-		for _, ip := range ips {
-			if out, err := exec.Command("ipset", "add", setName, ip, "-exist").CombinedOutput(); err != nil {
-				g.log.Error("failed to add ipset entry", "set", setName, "ip", ip, "error", err, "output", strings.TrimSpace(string(out)))
-			}
-		}
-		return true
-	}
+	torV4, torV6 := splitIPsByFamily(torIPs)
+	otherV4, otherV6 := splitIPsByFamily(otherIPs)
 
-	if ok := applySet(ipsetName, otherIPs); !ok {
+	manualByFamily := map[string][]string{"inet": otherV4, "inet6": otherV6}
+	torByFamily := map[string][]string{"inet": torV4, "inet6": torV6}
+
+	for _, fam := range linuxFamilies() {
+		if !g.applySet(fam.manualSet, fam.inet, manualByFamily[fam.inet]) {
+			continue
+		}
+		if !g.applySet(fam.torSet, fam.inet, torByFamily[fam.inet]) {
+			continue
+		}
+		g.ensureRejectRule(fam.iptables, fam.manualSet, nil)
+		g.ensureRejectRule(fam.iptables, fam.torSet, []string{"-m", "comment", "--comment", torRuleComment})
+	}
+}
+
+// applySet creates (idempotently) and repopulates an ipset of the given family
+// with the desired IPs. Returns false when the set itself could not be
+// created/flushed, so the caller skips adding a rule that would never match.
+func (g *Guard) applySet(setName string, inet string, ips []string) bool {
+	if out, err := exec.Command("ipset", "create", setName, "hash:ip", "family", inet, "-exist").CombinedOutput(); err != nil {
+		g.log.Error("failed to create ipset", "set", setName, "family", inet, "error", err, "output", strings.TrimSpace(string(out)))
+		return false
+	}
+	if out, err := exec.Command("ipset", "flush", setName).CombinedOutput(); err != nil {
+		g.log.Error("failed to flush ipset", "set", setName, "error", err, "output", strings.TrimSpace(string(out)))
+		return false
+	}
+	for _, ip := range ips {
+		if out, err := exec.Command("ipset", "add", setName, ip, "-exist").CombinedOutput(); err != nil {
+			g.log.Error("failed to add ipset entry", "set", setName, "ip", ip, "error", err, "output", strings.TrimSpace(string(out)))
+		}
+	}
+	return true
+}
+
+// ensureRejectRule appends an OUTPUT REJECT rule for the named set if an
+// identical rule is not already present. extra carries any leading match
+// arguments (e.g. the Tor comment) so the check and add stay in sync.
+func (g *Guard) ensureRejectRule(iptables string, setName string, extra []string) {
+	match := append([]string{}, extra...)
+	match = append(match, "-m", "set", "--match-set", setName, "dst", "-j", "REJECT")
+
+	check := append([]string{"-C", "OUTPUT"}, match...)
+	if err := exec.Command(iptables, check...).Run(); err == nil {
 		return
 	}
-	if ok := applySet(torIPSetName, torIPs); !ok {
-		return
-	}
 
-	if err := exec.Command("iptables", "-C", "OUTPUT", "-m", "set", "--match-set", ipsetName, "dst", "-j", "REJECT").Run(); err != nil {
-		if out, addErr := exec.Command("iptables", "-A", "OUTPUT", "-m", "set", "--match-set", ipsetName, "dst", "-j", "REJECT").CombinedOutput(); addErr != nil {
-			g.log.Error("failed to add iptables rule", "set", ipsetName, "error", addErr, "output", strings.TrimSpace(string(out)))
-		}
-	}
-
-	if err := exec.Command("iptables", "-C", "OUTPUT", "-m", "comment", "--comment", torRuleComment, "-m", "set", "--match-set", torIPSetName, "dst", "-j", "REJECT").Run(); err == nil {
-		return
-	}
-
-	if out, err := exec.Command("iptables", "-A", "OUTPUT", "-m", "comment", "--comment", torRuleComment, "-m", "set", "--match-set", torIPSetName, "dst", "-j", "REJECT").CombinedOutput(); err != nil {
-		g.log.Error("failed to add tor iptables rule", "set", torIPSetName, "error", err, "output", strings.TrimSpace(string(out)))
+	add := append([]string{"-A", "OUTPUT"}, match...)
+	if out, err := exec.Command(iptables, add...).CombinedOutput(); err != nil {
+		g.log.Error("failed to add iptables rule", "cmd", iptables, "set", setName, "error", err, "output", strings.TrimSpace(string(out)))
 	}
 }
